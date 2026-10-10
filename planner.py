@@ -46,6 +46,8 @@ Rules:
   Use {answer} inside "text" to insert the result of the last summarize step.
 - open_app: "target" is the app name exactly as in the installed app list.
 - open_url: "target" is a full URL. For research, open https://www.google.com/search?q=... directly.
+- To write into a notes or documents app (Notes, TextEdit, Pages, Word…), first create a new note or
+  document with the shortcut "new_window" (⌘N), then type.
 - Messaging means the desktop app (WhatsApp, Slack, Messages) when it is installed. To message
   someone: open the app, open the chat with them (search it if needed), type, press Enter.
 - Use only apps from installed_apps; names in parentheses are other names the app answers to

@@ -139,7 +139,7 @@ SHORTCUTS = {   # name: (description, key, modifiers)
     "minimize": ("Minimize the window", "m", ["command"]),
     "fullscreen": ("Toggle full screen", "f", ["command", "control"]),
     "save": ("Save the file / page", "s", ["command"]),
-    "new_window": ("Open a new window", "n", ["command"]),
+    "new_window": ("New window / new note / new document (⌘N)", "n", ["command"]),
     "open_file": ("Open a file", "o", ["command"]),
 }
 TERMINALS = {"Terminal", "iTerm2", "iTerm", "Warp", "Ghostty", "kitty", "Alacritty", "Hyper", "WezTerm"}
@@ -975,6 +975,60 @@ def replaceable(it: dict) -> bool:
     return not isinstance(val, str) or len(val) <= 300
 
 
+def focused_text_element(ctx: Ctx):
+    """The focused element if it is a text box, else None."""
+    app = find_running(ctx.active_app) if ctx.active_app else None
+    if not app:
+        return None
+    el = ax(AXUIElementCreateApplication(app.processIdentifier()), "AXFocusedUIElement")
+    return el if el is not None and ax(el, "AXRole") in TEXT_ROLES else None
+
+
+def text_target(ctx: Ctx) -> dict | None:
+    """Where to type when Jev chose no element: the focused text box, else the largest visible
+    multi-line text area (a note body, a document, a chat composer)."""
+    if focused_text_element(ctx) is not None:
+        return None   # already focused: just paste
+    best, best_area = None, 0.0
+    for it in read_screen(ctx.active_app):
+        if it["role"] not in ("AXTextArea", "AXTextField"):
+            continue
+        r = ax_rect(it["el"])
+        area = r[2] * r[3] if r else 0
+        if it["role"] == "AXTextArea":
+            area *= 4   # prefer bodies over single-line fields
+        if area > best_area:
+            best, best_area = it, area
+    return best
+
+
+NOT_EDITABLE = {"AXOutline", "AXTable", "AXList", "AXRow", "AXCell", "AXButton", "AXWindow", "AXScrollArea",
+                "AXSplitGroup", "AXToolbar", "AXStaticText", "AXImage", "AXLink", "AXMenuItem"}
+
+
+def text_landed(ctx: Ctx, text: str) -> bool:
+    """After pasting: did the text arrive? False only when it clearly did not (nothing focused, or a
+    list / button / row has focus, or a readable text box does not contain it). Rich web editors that
+    do not expose their text count as yes."""
+    time.sleep(0.2)
+    app = find_running(ctx.active_app) if ctx.active_app else None
+    if not app:
+        return True
+    el = ax(AXUIElementCreateApplication(app.processIdentifier()), "AXFocusedUIElement")
+    if el is None:
+        return False   # nothing has focus: the paste went nowhere
+    role = ax(el, "AXRole")
+    if role in NOT_EDITABLE:
+        return False
+    if role not in TEXT_ROLES:
+        return True    # e.g. a web editor (AXGroup / AXWebArea): cannot check
+    val = ax(el, "AXValue")
+    if not isinstance(val, str):
+        return True    # the app does not expose its text: cannot check
+    norm = lambda s: re.sub(r"\s+", " ", s).strip().casefold()  # noqa: E731
+    return norm(text)[:40] in norm(val)
+
+
 def execute(d: dict, cmd: str, ctx: Ctx) -> str:
     act = d["action"]
     if act in ("click", "type", "enter", "escape", "scroll", "back", "shortcut") and ctx.active_app:
@@ -1026,12 +1080,17 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
             raise RuntimeError("could not tell what to type (you can put it in quotes)")
         if ctx.active_app in TERMINALS and not ctx.io.confirm(f"Type into {ctx.active_app}: {text!r}?"):
             raise RuntimeError("cancelled by user (typing into a terminal)")
+        if it is None and not ctx.dry_run:
+            it = text_target(ctx)   # nothing chosen: the focused box, or the main text area on screen
         if it:
             press(it, ctx)   # focus the box
             time.sleep(0.15)
         if it and replaceable(it):   # clear leftovers in search/message boxes, never in documents
             osa('tell application "System Events" to keystroke "a" using command down', ctx)
         paste_text(text, ctx)
+        if not ctx.dry_run and not text_landed(ctx, text):
+            raise RuntimeError("the text did not appear: no text box was ready (open a new note / document "
+                               "or click the text area first)")
         return f"typed '{text}'" + (f" ({it['label'][:30]})" if it else "")
 
     if act == "enter":
