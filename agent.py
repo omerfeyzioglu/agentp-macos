@@ -311,14 +311,21 @@ def key(code: int, ctx: Ctx):
 
 
 def paste_text(text: str, ctx: Ctx):
-    """Clipboard + cmd+v instead of keystrokes (handles non-ASCII text)."""
+    """Clipboard + cmd+v instead of keystrokes (handles any language and emoji). The user's clipboard
+    is restored only after the app has taken the paste: some apps paste late, and restoring too early
+    would paste the old clipboard instead."""
     if ctx.dry_run:
         ctx.io.say(f"    (dry-run) paste: {text!r}")
         return
     old = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
     subprocess.run(["pbcopy"], input=text, text=True)
     osa('tell application "System Events" to keystroke "v" using command down', ctx)
-    time.sleep(0.25)
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        time.sleep(0.1)
+        seen = focused_contains(ctx, text)
+        if seen is True or (seen is None and time.time() > deadline - 1.0):   # unreadable fields: 0.5 s
+            break
     subprocess.run(["pbcopy"], input=old, text=True)
 
 
@@ -1006,6 +1013,21 @@ NOT_EDITABLE = {"AXOutline", "AXTable", "AXList", "AXRow", "AXCell", "AXButton",
                 "AXSplitGroup", "AXToolbar", "AXStaticText", "AXImage", "AXLink", "AXMenuItem"}
 
 
+def focused_contains(ctx: Ctx, text: str):
+    """True / False if the focused text box does / does not contain the text yet; None if unknown."""
+    app = find_running(ctx.active_app) if ctx.active_app else None
+    if not app:
+        return None
+    el = ax(AXUIElementCreateApplication(app.processIdentifier()), "AXFocusedUIElement")
+    if el is None or ax(el, "AXRole") not in TEXT_ROLES:
+        return None
+    val = ax(el, "AXValue")
+    if not isinstance(val, str):
+        return None
+    norm = lambda s: re.sub(r"\s+", " ", s).strip().casefold()  # noqa: E731
+    return norm(text)[:40] in norm(val)
+
+
 def text_landed(ctx: Ctx, text: str) -> bool:
     """After pasting: did the text arrive? False only when it clearly did not (nothing focused, or a
     list / button / row has focus, or a readable text box does not contain it). Rich web editors that
@@ -1091,7 +1113,8 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         if not ctx.dry_run and not text_landed(ctx, text):
             raise RuntimeError("the text did not appear: no text box was ready (open a new note / document "
                                "or click the text area first)")
-        return f"typed '{text}'" + (f" ({it['label'][:30]})" if it else "")
+        short = text if len(text) <= 60 else text[:57].rstrip() + "…"
+        return f"typed '{short}'" + (f" ({it['label'][:30]})" if it else "")
 
     if act == "enter":
         key(36, ctx)

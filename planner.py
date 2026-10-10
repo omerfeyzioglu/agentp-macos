@@ -244,9 +244,11 @@ class Gemini:
         return text.strip(), sources[:4], search_suggestions(meta)
 
     def summarize(self, cmd: str, where: str, texts: list[str]) -> str:
-        system = ("Answer the user's request using only the screen text given. Be short: at most 4 "
-                  "sentences, plain text, in the user's language. If the text does not contain the "
-                  "answer, say so in one sentence.")
+        system = ("Summarize what the screen text says about the topic of the user's request, or answer "
+                  "the question in it, using only that text. Ignore the parts of the request about where to "
+                  "save, note or send the result. Never talk about the screen, apps, or what is missing. "
+                  "At most 4 sentences, plain text, no markdown, in the user's language. If nothing on the "
+                  "screen is relevant, answer only: No relevant information found.")
         prompt = json.dumps({"user_request": cmd, "screen": where, "screen_text": texts[:400]},
                             ensure_ascii=False)
         return self._generate(system, prompt).strip()
