@@ -50,6 +50,9 @@ Rules:
   document with the shortcut "new_window" (⌘N), then type.
 - Messaging means the desktop app (WhatsApp, Slack, Messages) when it is installed. To message
   someone: open the app, open the chat with them (search it if needed), type, press Enter.
+- People the user messages, calls or emails are the user's own contacts: search them in the app's own
+  chat / contact search (e.g. the DM "New message" search) with exactly the name the user said. Never
+  use a web handle, profile URL or global site search for them, even if a famous person shares the name.
 - Use only apps from installed_apps; names in parentheses are other names the app answers to
   (e.g. an app listed as "ChatGPT (openai codex)" IS the Codex app). If the app the user asks for
   is not installed, do not silently swap it: describe that in "issue" and, if a reasonable
@@ -185,9 +188,12 @@ class Gemini:
         as most people would mean them, with their official links. [] if it names none (no search then)."""
         if not self.grounding:
             return []
-        system = ("You resolve names for a computer agent. Find the specific people, creators, channels, "
-                  "brands, products, organisations or places named in the request (not generic words). Skip "
-                  "names in already_known. For each, search the web and identify the one most people mean "
+        system = ("You resolve names for a computer agent. Find the specific public figures, creators, "
+                  "channels, brands, products, organisations or places named in the request (not generic "
+                  "words). NEVER include a person the user wants to message, call, email, text, reply to, send "
+                  "something to or open a chat with: that is the user's own contact, not a public figure, even "
+                  "if a famous person has the same name. Still resolve the public names in the same request: in "
+                  "'send mkbhd's latest video to Alex', resolve mkbhd and not Alex. Skip names in already_known. For each, search the web and identify the one most people mean "
                   "(the well-known one), with its official links. Answer with JSON only: "
                   '[{"name": "...", "about": "one short line", "links": {"youtube": "...", "instagram": "...", '
                   '"x": "...", "website": "..."}}]. Only include links you found. If there are no such names, '
