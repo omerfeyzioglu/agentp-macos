@@ -896,7 +896,7 @@ def decide(client, cmd: str, ctx: Ctx, items: list[dict], steps: list[str], fail
                     choice, conf, source = f"e{i}", 1.0, "on screen"
                     break
         if conf < CONF_OK and source == "jev":
-            remembered = ctx.memory.find_pick(ctx.active_app, cmd, items)
+            remembered = ctx.memory.find_pick(ctx.active_app, cmd, items, out["action"])
             if remembered is not None:
                 choice, conf, source = f"e{items.index(remembered)}", 1.0, "memory"
             elif ranked(ch):
@@ -916,7 +916,7 @@ def decide(client, cmd: str, ctx: Ctx, items: list[dict], steps: list[str], fail
                     source = "user"
                     if n is not None:
                         it = items[int(choice[1:])]
-                        ctx.memory.add_pick(ctx.active_app, cmd, it["role"], it["label"])
+                        ctx.memory.add_pick(ctx.active_app, cmd, it["role"], it["label"], out["action"])
         out["element"] = None if choice == "none" else items[int(choice[1:])]
         out["elem_conf"], out["elem_source"] = conf, source
 
@@ -938,7 +938,7 @@ def decide(client, cmd: str, ctx: Ctx, items: list[dict], steps: list[str], fail
         out["shortcut"] = (step.get("target") if step and step.get("target") in SHORTCUTS
                            else next(iter(built["plan_keys"])))
     out["plan_step"] = a["plan_step"].choice if plan else None
-    out["fresh"] = (a["fresh"].noul or 0) >= 0.5 if "fresh" in questions else True
+    out["fresh"] = (a["fresh"].noul or 0) >= 0.5 if "fresh" in a else True
     return out
 
 
@@ -1063,7 +1063,7 @@ def text_target(ctx: Ctx) -> dict | None:
 
 
 NOT_EDITABLE = {"AXOutline", "AXTable", "AXList", "AXRow", "AXCell", "AXButton", "AXWindow", "AXScrollArea",
-                "AXSplitGroup", "AXToolbar", "AXStaticText", "AXImage", "AXLink", "AXMenuItem"}
+                "AXSplitGroup", "AXToolbar", "AXStaticText", "AXImage", "AXLink", "AXMenuItem", "AXWebArea"}
 
 
 def focused_contains(ctx: Ctx, text: str):
@@ -1229,6 +1229,8 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
             raise RuntimeError("could not tell what to type (you can put it in quotes)")
         if ctx.active_app in TERMINALS and not ctx.io.confirm(f"Type into {ctx.active_app}: {text!r}?"):
             raise RuntimeError("cancelled by user (typing into a terminal)")
+        if it is not None and it["role"] not in TEXT_ROLES:
+            it = None   # a row / button / link is not somewhere to type
         if it is None and not ctx.dry_run:
             it = text_target(ctx)   # nothing chosen: the focused box, or the main text area on screen
         if it:
@@ -1355,6 +1357,9 @@ def path_step(d: dict) -> dict:
 
 
 # ---------------------------------------------------------------- the loop
+NOT_FOUND = re.compile(r"doesn.t have any content|this page isn.t available|page not found|this page "
+                       r"(could not|couldn.t) be found|sorry, this page|isn.t available right now|404 not found|"
+                       r"this account doesn.t exist|user not found|channel (does not|doesn.t) exist", re.I)
 REPEAT_WINDOW = 180   # seconds: asking the same thing again this soon means the last attempt failed
 
 
@@ -1441,8 +1446,10 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
             save("done", True)
             ok = True
             break
-        sig = (act, d["element"]["label"] if d.get("element") else None, d.get("text"), d.get("site"))
-        if sig == last_sig and act != "type" and steps and "FAILED" not in steps[-1] and "no change" not in steps[-1]:
+        el_label = d["element"]["label"] if d.get("element") else None
+        sig = (act, el_label, d.get("text") if act == "type" else None, d.get("site") if act == "open_url" else None)
+        if sig == last_sig and act not in ("type", "scroll") and steps and "FAILED" not in steps[-1] \
+                and "no change" not in steps[-1]:
             if plan and plan_at < len(plan):
                 # plan steps are left: this element did its job, make Jev pick the next thing
                 if d.get("element"):
@@ -1461,6 +1468,22 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
                 save("cancelled by user", False)
                 cancelled = True
                 break
+
+        stuck = None
+        if act == "scroll" and len(steps) >= 2 and all(s.startswith("scrolled") for s in steps[-2:]):
+            stuck = "scrolled three times without finding it: this may be the wrong page"
+        if stuck:
+            say(f"     ✗ {stuck}")
+            steps.append(f"{act}: FAILED ({stuck})")
+            save(stuck, False)
+            if plan is None or replanned:
+                break
+            try:
+                plan = make_plan(cmd, ctx, timings, steps, problem=stuck)
+            except PlanRejected:
+                break
+            replanned, plan_at = True, 0
+            continue
 
         before = screen_signature(items)
         try:
@@ -1511,6 +1534,18 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
         items = wait_for_change(ctx.active_app, before, timeout,
                                 min_items=8 if act in ("open_app", "open_url") else 0)
         changed = screen_signature(items) != before
+        if act == "open_url" and any(NOT_FOUND.search(i["label"]) for i in items[:300]):
+            wrong = "the page says it does not exist or has no content (wrong address?)"
+            say(f"     ✗ {wrong}")
+            steps[-1] += f" (but {wrong})"
+            save(steps[-1], False)
+            if plan is not None and not replanned:
+                try:
+                    plan = make_plan(cmd, ctx, timings, steps, problem=wrong)
+                    replanned, plan_at = True, 0
+                    continue
+                except PlanRejected:
+                    break
         if act == "click" and not changed and d.get("element") and not ctx.dry_run and mouse_click(d["element"]):
             items = wait_for_change(ctx.active_app, before, 2.0)   # AXPress was ignored: real click
             changed = screen_signature(items) != before
@@ -1644,6 +1679,20 @@ def plan_worthy(cmd: str, ctx: Ctx) -> bool:
     return bool(ctx.planner) and (len(cmd.split()) >= 4 or bool(PLAN_WORTHY.search(cmd)))
 
 
+CONTACT_CUES = r"(to|with|call|message|messages|text|texts|email|mail|dm|chat|reply|ping|tell|ask)"
+
+
+def is_contact(cmd: str, name: str) -> bool:
+    """Is this name the person the user is messaging / calling ('say hi to Alex', 'call John', 'text mom')?
+    Those are the user's own contacts, never looked up on the web."""
+    low = " ".join(re.findall(r"\w+", cmd.casefold()))
+    words = re.findall(r"\w+", name.casefold())
+    if not words:
+        return False
+    first = re.escape(words[0])
+    return re.search(rf"\b{CONTACT_CUES}\s+(the\s+|my\s+)?{first}\b", low) is not None
+
+
 def fetch_plan(cmd: str, ctx: Ctx, done: list[str] | None = None, problem: str | None = None,
                clarified: str | None = None) -> dict:
     """The network part of planning, without any output (safe to run in parallel)."""
@@ -1667,6 +1716,7 @@ def fetch_plan(cmd: str, ctx: Ctx, done: list[str] | None = None, problem: str |
                 new = lookup.result(timeout=10)
             except Exception:
                 new = []
+        new = [f for f in new if not is_contact(cmd, f["name"])]
         if new:   # the request names someone / something we did not know: plan again with the facts
             ctx.memory.add_facts(new)
             plan, issue, clarify = ctx.planner.plan(cmd, where, ctx.history[-HISTORY_LEN:], apps, done, problem,

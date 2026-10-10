@@ -47,19 +47,20 @@ class Memory:
             pass
 
     # ------------------------------------------------ user picks
-    def add_pick(self, app: str | None, cmd: str, role: str, label: str):
-        self.data["picks"].append({"app": app, "cmd": cmd, "role": role, "label": label})
+    def add_pick(self, app: str | None, cmd: str, role: str, label: str, action: str = "click"):
+        self.data["picks"].append({"app": app, "cmd": cmd, "role": role, "label": label, "action": action})
         self.data["picks"] = self.data["picks"][-MAX_PICKS:]
         self._save()
 
-    def find_pick(self, app: str | None, cmd: str, items: list[dict]) -> dict | None:
-        """If the user picked an element for a similar request in this app and it is on screen, return it."""
+    def find_pick(self, app: str | None, cmd: str, items: list[dict], action: str = "click") -> dict | None:
+        """If the user picked an element for a similar request in this app, for the same action,
+        and it is on screen, return it."""
         if not self.enabled:
             return None
         by_label = {(i["role"], i["label"]): i for i in items}
         best, best_sim = None, 0.75
         for p in reversed(self.data["picks"]):
-            if p["app"] != app:
+            if p["app"] != app or p.get("action", "click") != action:
                 continue
             sim = similarity(p["cmd"], cmd)
             it = by_label.get((p["role"], p["label"]))
