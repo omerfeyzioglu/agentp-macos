@@ -164,10 +164,13 @@ def tidy_question(msg: str) -> str:
 
 # ---------------------------------------------------------------- views
 class KeyPanel(NSPanel):
-    """Borderless panels cannot become key by default; this one can (to type into it)."""
+    """Borderless panels cannot become key by default; this one can (to type into it). While the
+    agent works, it gives the keyboard back so keys reach the app being operated."""
+
+    lets_go_of_keyboard = False
 
     def canBecomeKeyWindow(self):
-        return True
+        return not self.lets_go_of_keyboard
 
 
 class Background(NSView):
@@ -444,6 +447,7 @@ class UI(NSObject):
         for v in list(self.prompt.subviews()):
             v.removeFromSuperview()
         self.answer_cb = callback
+        self.panel.lets_go_of_keyboard = False
         if len(buttons) > 2:
             self._ask_list(question, buttons, default, cancel)
             return
@@ -520,6 +524,9 @@ class UI(NSObject):
 
     def answer_(self, sender):
         cb, self.answer_cb = self.answer_cb, None
+        self.panel.lets_go_of_keyboard = self.busy
+        if self.busy:
+            self.panel.resignKeyWindow()
         self.prompt.setHidden_(True)
         self.scroll.setFrame_(NSMakeRect(PAD - 4, 12, W - PAD * 2 + 8, H - INPUT_H - 18))
         if cb:
@@ -557,10 +564,13 @@ class UI(NSObject):
         self.busy = busy
         self.field.setEditable_(not busy)
         self.mic.setHidden_(busy)
+        self.panel.lets_go_of_keyboard = busy
         if busy:
             self.spinner.startAnimation_(None)
+            self.panel.resignKeyWindow()   # keys typed by the agent must reach the target app
         else:
             self.spinner.stopAnimation_(None)
+            self.panel.makeKeyAndOrderFront_(None)
             self.panel.makeFirstResponder_(self.field)
 
     # ------------------------------------------------ menu bar + hotkeys

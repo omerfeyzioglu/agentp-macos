@@ -45,6 +45,7 @@ from typesafe_sdk import Choice, Noul, TypeSafeClient
 
 import config
 from memory import Memory
+from memory import similarity as memory_similarity
 
 try:
     import planner as llm
@@ -224,6 +225,7 @@ class Ctx:
     history: list = field(default_factory=list)
     last_cmd_id: str | None = None
     last_cmd: str | None = None
+    last_cmd_at: float = 0.0
     record: bool = True
     dry_run: bool = False
     planner: object = None           # planner.Gemini or None (Jev-only)
@@ -306,6 +308,44 @@ def osa(script: str, ctx: Ctx):
         raise RuntimeError(f"osascript: {r.stderr.strip()}")
 
 
+KEYCODES = {"a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12,
+            "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+            "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34,
+            "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46}
+MOD_FLAGS = {"command": 1 << 20, "shift": 1 << 17, "option": 1 << 19, "control": 1 << 18}
+
+
+def press_keys(ctx: Ctx, code: int, mods: list[str] = ()) -> bool:
+    """Send a key (with modifiers) straight to the app being operated, so it arrives even when another
+    window (such as AgentP's own panel) has keyboard focus. False if it could not be sent that way."""
+    if ctx.dry_run:
+        ctx.io.say(f"    (dry-run) key {code} {'+'.join(mods)}")
+        return True
+    app = find_running(ctx.active_app) if ctx.active_app else None
+    if app is None:
+        return False
+    try:
+        import Quartz
+        flags = 0
+        for m in mods:
+            flags |= MOD_FLAGS[m]
+        pid = app.processIdentifier()
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, code, down)
+            Quartz.CGEventSetFlags(ev, flags)
+            Quartz.CGEventPostToPid(pid, ev)
+            time.sleep(0.02)
+        return True
+    except Exception:
+        return False
+
+
+def keystroke(ctx: Ctx, char: str, mods: list[str] = ()):
+    """A character key with modifiers (⌘V, ⌘A, ⌘N…) through System Events."""
+    using = " using {" + ", ".join(f"{m} down" for m in mods) + "}" if mods else ""
+    osa(f'tell application "System Events" to keystroke "{char}"{using}', ctx)
+
+
 def key(code: int, ctx: Ctx):
     osa(f'tell application "System Events" to key code {code}', ctx)
 
@@ -319,14 +359,23 @@ def paste_text(text: str, ctx: Ctx):
         return
     old = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
     subprocess.run(["pbcopy"], input=text, text=True)
-    osa('tell application "System Events" to keystroke "v" using command down', ctx)
-    deadline = time.time() + 1.5
+    keystroke(ctx, "v", ["command"])
+    seen = wait_for_paste(ctx, text)
+    if seen is False:   # the paste did not arrive (another window had keyboard focus): send ⌘V to the app itself
+        press_keys(ctx, KEYCODES["v"], ["command"])
+        wait_for_paste(ctx, text)
+    subprocess.run(["pbcopy"], input=old, text=True)
+
+
+def wait_for_paste(ctx: Ctx, text: str):
+    """Until the focused box contains the text (True), it clearly did not (False), or it is unreadable (None)."""
+    deadline, seen = time.time() + 1.0, None
     while time.time() < deadline:
         time.sleep(0.1)
         seen = focused_contains(ctx, text)
-        if seen is True or (seen is None and time.time() > deadline - 1.0):   # unreadable fields: 0.5 s
+        if seen is True or (seen is None and time.time() > deadline - 0.5):   # unreadable fields: 0.5 s
             break
-    subprocess.run(["pbcopy"], input=old, text=True)
+    return seen
 
 
 # ---------------------------------------------------------------- apps
@@ -1075,6 +1124,17 @@ def ax_insert(ctx: Ctx, text: str, replace: bool) -> bool:
     return focused_contains(ctx, text) is not False
 
 
+def field_action(ctx: Ctx, action: str) -> bool:
+    """Run Enter (AXConfirm) / Esc (AXCancel) on the focused native text field itself, when it offers
+    that action. Independent of keyboard focus. Web and Electron apps get the real key instead."""
+    if not is_native(ctx.active_app):
+        return False
+    el = focused_element(ctx)
+    if el is None or ax(el, "AXRole") not in TEXT_ROLES or action not in ax_actions(el):
+        return False
+    return AXUIElementPerformAction(el, action) == 0
+
+
 def menu_item_for(app_name: str | None, key: str, mods: list[str]):
     """(menu item, title) of the app's menu item with this keyboard shortcut, e.g. ⌘N → File > New Note."""
     app = find_running(app_name) if app_name else None
@@ -1178,7 +1238,7 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         replace = bool(it) and replaceable(it)   # clear leftovers in search/message boxes, never in documents
         if ctx.dry_run or not ax_insert(ctx, text, replace):
             if replace:
-                osa('tell application "System Events" to keystroke "a" using command down', ctx)
+                keystroke(ctx, "a", ["command"])
             paste_text(text, ctx)
         if not ctx.dry_run and not text_landed(ctx, text, before):
             raise RuntimeError("the text did not appear: no text box was ready (open a new note / document "
@@ -1187,10 +1247,14 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         return f"typed '{short}'" + (f" ({it['label'][:30]})" if it else "")
 
     if act == "enter":
+        if not ctx.dry_run and field_action(ctx, "AXConfirm"):   # e.g. a search field: run the search
+            return "pressed Enter"
         key(36, ctx)
         return "pressed Enter"
 
     if act == "escape":
+        if not ctx.dry_run and field_action(ctx, "AXCancel"):
+            return "pressed Esc"
         key(53, ctx)
         return "pressed Esc"
 
@@ -1208,7 +1272,7 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         if app in BROWSERS and app != "Safari":   # Chromium: ⌘[ is lost when the page has focus
             osa(f'tell application "{app}" to go back active tab of front window', ctx)
         else:
-            osa('tell application "System Events" to keystroke "[" using command down', ctx)
+            keystroke(ctx, "[", ["command"])
         return "went back"
 
     if act == "shortcut":
@@ -1220,8 +1284,7 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         if item is not None:   # the app's own menu item: works whatever window has keyboard focus
             AXUIElementPerformAction(item[0], "AXPress")
             return f"{desc.lower()} (menu: {item[1]})"
-        using = " using {" + ", ".join(f"{m} down" for m in mods) + "}"
-        osa(f'tell application "System Events" to keystroke "{k}"{using}', ctx)
+        keystroke(ctx, k, mods)
         return desc.lower()
 
     if act == "quit_app":
@@ -1278,7 +1341,7 @@ def is_send(d: dict, steps: list[str]) -> bool:
 
 
 def clear_field(ctx: Ctx):
-    osa('tell application "System Events" to keystroke "a" using command down', ctx)
+    keystroke(ctx, "a", ["command"])
     key(51, ctx)   # delete
 
 
@@ -1292,8 +1355,14 @@ def path_step(d: dict) -> dict:
 
 
 # ---------------------------------------------------------------- the loop
+REPEAT_WINDOW = 180   # seconds: asking the same thing again this soon means the last attempt failed
+
+
 def handle(client, cmd: str, ctx: Ctx) -> dict:
     t0 = time.perf_counter()
+    if ctx.last_cmd and time.time() - ctx.last_cmd_at < REPEAT_WINDOW and \
+            memory_similarity(cmd, ctx.last_cmd) >= 0.85:
+        ctx.memory.forget_last_path(ctx.last_cmd)   # don't learn (or reuse) a path that did not work
     cmd_id = uuid.uuid4().hex[:12]
     timings: dict = {}
     steps: list[str] = []
@@ -1463,7 +1532,7 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
     parts = "  ".join(f"{k}={v:.0f}ms" for k, v in timings.items())
     say(f"  ⏱ {total:.0f} ms  [{parts}]")
     ctx.history.append({"request": cmd, "steps": steps})
-    ctx.last_cmd_id, ctx.last_cmd = cmd_id, cmd
+    ctx.last_cmd_id, ctx.last_cmd, ctx.last_cmd_at = cmd_id, cmd, time.time()
     if ok and not cancelled and done_steps:
         ctx.memory.add_path(cmd, done_steps)
     if ctx.record:
