@@ -1182,6 +1182,26 @@ def text_landed(ctx: Ctx, text: str, before: tuple = (None, None)) -> bool:
     return True    # the app exposes neither: cannot check
 
 
+EMPTY_SUMMARY = "no relevant information found"
+
+
+def is_empty_summary(text: str | None) -> bool:
+    return not text or text.strip().casefold().rstrip(".") == EMPTY_SUMMARY
+
+
+def summary_texts(ctx: Ctx, items: list[dict], min_page_texts: int = 20) -> list[str]:
+    """The page's own text in reading order (browser menus last). Waits up to 3 s while the page is
+    still filling in: a results page reports 'loaded' before its results are there."""
+    def page_texts(its):
+        return [i for i in its if i.get("page") and i["role"] in READ_ROLES | {"AXLink"}]
+    deadline = time.time() + 3.0
+    while not ctx.dry_run and ctx.active_app and len(page_texts(items)) < min_page_texts and time.time() < deadline:
+        time.sleep(0.4)
+        items = read_screen(ctx.active_app)
+    ordered = sorted(items, key=lambda i: (not i.get("page"), i.get("order", 0)))
+    return list(dict.fromkeys(i["label"] for i in ordered))
+
+
 def execute(d: dict, cmd: str, ctx: Ctx) -> str:
     act = d["action"]
     if act in ("click", "type", "enter", "escape", "scroll", "back", "shortcut") and ctx.active_app:
@@ -1317,10 +1337,15 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
     if act == "summarize":
         if not ctx.planner:
             raise RuntimeError("summarizing needs GEMINI_API_KEY")
-        items_all = d.get("screen_items") or []
-        texts = [i["label"] for i in sorted(items_all, key=lambda i: (not i.get("page"), i.get("order", 0)))]
         where = where_am_i(ctx.active_app) if ctx.active_app and not ctx.dry_run else ""
-        ctx.last_answer = ctx.planner.summarize(cmd, where, texts)
+        texts = summary_texts(ctx, d.get("screen_items") or [])
+        answer = ctx.planner.summarize(cmd, where, texts)
+        if is_empty_summary(answer) and not ctx.dry_run:   # the page may still have been filling in
+            time.sleep(1.2)
+            answer = ctx.planner.summarize(cmd, where, summary_texts(ctx, read_screen(ctx.active_app)))
+        if is_empty_summary(answer):
+            raise RuntimeError("nothing relevant on this page to summarize (open a result first?)")
+        ctx.last_answer = answer
         ctx.io.say(f"     💬 {ctx.last_answer}")
         if not ctx.dry_run:
             subprocess.Popen(["say", ctx.last_answer[:400]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
