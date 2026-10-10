@@ -896,7 +896,8 @@ def decide(client, cmd: str, ctx: Ctx, items: list[dict], steps: list[str], fail
                     choice, conf, source = f"e{i}", 1.0, "on screen"
                     break
         if conf < CONF_OK and source == "jev":
-            remembered = ctx.memory.find_pick(ctx.active_app, cmd, items, out["action"])
+            remembered = ctx.memory.find_pick(ctx.active_app, cmd, [i for i in items if
+                                              (i["role"], i["label"]) not in failed], out["action"])
             if remembered is not None:
                 choice, conf, source = f"e{items.index(remembered)}", 1.0, "memory"
             elif ranked(ch):
@@ -1050,9 +1051,12 @@ def text_target(ctx: Ctx) -> dict | None:
     if focused_text_element(ctx) is not None:
         return None   # already focused: just paste
     best, best_area = None, 0.0
+    in_browser = ctx.active_app in BROWSERS
     for it in read_screen(ctx.active_app):
         if it["role"] not in ("AXTextArea", "AXTextField"):
             continue
+        if in_browser and not it.get("page"):
+            continue   # the address bar and other browser fields are never a place for a message
         r = ax_rect(it["el"])
         area = r[2] * r[3] if r else 0
         if it["role"] == "AXTextArea":
@@ -1505,6 +1509,9 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
             continue
         steps.append(result)
         done_steps.append(path_step(d))
+        if act == "click" and d.get("element"):
+            # clicking it again would undo it (checkboxes, toggles, selected contacts): not offered again
+            failed.add((d["element"]["role"], d["element"]["label"]))
         ps = d.get("plan_step") or ""
         if plan and ps.startswith("s") and step_done_by(plan[int(ps[1:])]["kind"], act):
             plan_at = max(plan_at, int(ps[1:]) + 1)   # a scroll does not complete a "click" step
