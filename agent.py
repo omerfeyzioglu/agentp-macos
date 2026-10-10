@@ -978,8 +978,12 @@ def replaceable(it: dict) -> bool:
         return True
     if it.get("el") is None:
         return True
-    val = ax(it["el"], "AXValue")
-    return not isinstance(val, str) or len(val) <= 300
+    val, n = ax(it["el"], "AXValue"), ax(it["el"], "AXNumberOfCharacters")
+    if isinstance(val, str):
+        return len(val) <= 300
+    if isinstance(n, int):
+        return n <= 300
+    return False   # content unknown (e.g. a note body): never overwrite, insert at the cursor
 
 
 def focused_text_element(ctx: Ctx):
@@ -1028,10 +1032,71 @@ def focused_contains(ctx: Ctx, text: str):
     return norm(text)[:40] in norm(val)
 
 
-def text_landed(ctx: Ctx, text: str) -> bool:
-    """After pasting: did the text arrive? False only when it clearly did not (nothing focused, or a
-    list / button / row has focus, or a readable text box does not contain it). Rich web editors that
-    do not expose their text count as yes."""
+def focused_element(ctx: Ctx):
+    app = find_running(ctx.active_app) if ctx.active_app else None
+    if not app:
+        return None
+    return ax(AXUIElementCreateApplication(app.processIdentifier()), "AXFocusedUIElement")
+
+
+def focused_value(ctx: Ctx) -> tuple:
+    """(text, character count) of the focused element; either may be None when the app hides it."""
+    el = focused_element(ctx)
+    if el is None:
+        return None, None
+    val, n = ax(el, "AXValue"), ax(el, "AXNumberOfCharacters")
+    return (val if isinstance(val, str) else None), (n if isinstance(n, int) else None)
+
+
+def is_native(app_name: str | None) -> bool:
+    """A native Mac app (not a browser or an Electron app), where text can be inserted through
+    Accessibility. Web and Electron apps get a real paste so their own code sees the input."""
+    if not app_name or app_name in BROWSERS:
+        return False
+    app = find_running(app_name)
+    url = app.bundleURL() if app else None
+    if url is None:
+        return False
+    return not (Path(str(url.path())) / "Contents" / "Frameworks" / "Electron Framework.framework").exists()
+
+
+def ax_insert(ctx: Ctx, text: str, replace: bool) -> bool:
+    """Write text straight into the focused native text view: at the cursor (documents, notes) or
+    replacing the content (search / message boxes). Independent of keyboard focus."""
+    if not is_native(ctx.active_app):
+        return False
+    el = focused_element(ctx)
+    if el is None or ax(el, "AXRole") not in TEXT_ROLES:
+        return False
+    attr = "AXValue" if replace else "AXSelectedText"
+    if AXUIElementSetAttributeValue(el, attr, text) != 0:
+        return False
+    time.sleep(0.1)
+    return focused_contains(ctx, text) is not False
+
+
+def menu_item_for(app_name: str | None, key: str, mods: list[str]):
+    """(menu item, title) of the app's menu item with this keyboard shortcut, e.g. ⌘N → File > New Note."""
+    app = find_running(app_name) if app_name else None
+    if not app:
+        return None
+    want = 0 if "command" in mods else 8               # kAXMenuItemModifierNone / NoCommand
+    want |= (1 if "shift" in mods else 0) | (2 if "option" in mods else 0) | (4 if "control" in mods else 0)
+    bar = ax(AXUIElementCreateApplication(app.processIdentifier()), "AXMenuBar")
+    for top in list(ax(bar, "AXChildren") or [])[1:] if bar is not None else []:
+        for menu in ax(top, "AXChildren") or []:
+            for it in ax(menu, "AXChildren") or []:
+                ch = ax(it, "AXMenuItemCmdChar")
+                if isinstance(ch, str) and ch.casefold() == key.casefold() and \
+                        (ax(it, "AXMenuItemCmdModifiers") or 0) == want and ax(it, "AXEnabled"):
+                    return it, f"{ax(top, 'AXTitle') or ''} > {ax(it, 'AXTitle') or ''}"
+    return None
+
+
+def text_landed(ctx: Ctx, text: str, before: tuple = (None, None)) -> bool:
+    """After typing: did the text arrive? False when it clearly did not: nothing focused, a list /
+    button / row has focus, or a readable text box neither contains it nor changed. Rich web editors
+    that do not expose their text count as yes."""
     time.sleep(0.2)
     app = find_running(ctx.active_app) if ctx.active_app else None
     if not app:
@@ -1044,11 +1109,13 @@ def text_landed(ctx: Ctx, text: str) -> bool:
         return False
     if role not in TEXT_ROLES:
         return True    # e.g. a web editor (AXGroup / AXWebArea): cannot check
-    val = ax(el, "AXValue")
-    if not isinstance(val, str):
-        return True    # the app does not expose its text: cannot check
     norm = lambda s: re.sub(r"\s+", " ", s).strip().casefold()  # noqa: E731
-    return norm(text)[:40] in norm(val)
+    val, n = ax(el, "AXValue"), ax(el, "AXNumberOfCharacters")
+    if isinstance(val, str):
+        return norm(text)[:40] in norm(val)
+    if isinstance(n, int) and before[1] is not None:
+        return n > before[1]   # text hidden, but the character count shows whether it grew
+    return True    # the app exposes neither: cannot check
 
 
 def execute(d: dict, cmd: str, ctx: Ctx) -> str:
@@ -1107,10 +1174,13 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         if it:
             press(it, ctx)   # focus the box
             time.sleep(0.15)
-        if it and replaceable(it):   # clear leftovers in search/message boxes, never in documents
-            osa('tell application "System Events" to keystroke "a" using command down', ctx)
-        paste_text(text, ctx)
-        if not ctx.dry_run and not text_landed(ctx, text):
+        before = None if ctx.dry_run else focused_value(ctx)
+        replace = bool(it) and replaceable(it)   # clear leftovers in search/message boxes, never in documents
+        if ctx.dry_run or not ax_insert(ctx, text, replace):
+            if replace:
+                osa('tell application "System Events" to keystroke "a" using command down', ctx)
+            paste_text(text, ctx)
+        if not ctx.dry_run and not text_landed(ctx, text, before):
             raise RuntimeError("the text did not appear: no text box was ready (open a new note / document "
                                "or click the text area first)")
         short = text if len(text) <= 60 else text[:57].rstrip() + "…"
@@ -1146,6 +1216,10 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
         if name not in SHORTCUTS:
             raise RuntimeError("could not tell which shortcut")
         desc, k, mods = SHORTCUTS[name]
+        item = None if ctx.dry_run else menu_item_for(ctx.active_app, k, mods)
+        if item is not None:   # the app's own menu item: works whatever window has keyboard focus
+            AXUIElementPerformAction(item[0], "AXPress")
+            return f"{desc.lower()} (menu: {item[1]})"
         using = " using {" + ", ".join(f"{m} down" for m in mods) + "}"
         osa(f'tell application "System Events" to keystroke "{k}"{using}', ctx)
         return desc.lower()
