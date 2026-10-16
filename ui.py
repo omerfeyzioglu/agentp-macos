@@ -555,11 +555,10 @@ class UI(NSObject):
     @objc.python_method
     def _run(self, cmd: str):
         try:
-            target = qa.test_target(cmd)
-            if target:   # "test example.com": exploratory functional testing
-                allow = self.ctx.io.confirm(f"Fill forms on {target} with made-up test data and submit them? "
+            if qa.TEST_REQUEST.search(cmd):   # "test example.com", "bu sayfayı test et", "test the login page of x.com"
+                allow = self.ctx.io.confirm("Fill forms with made-up test data and submit them? "
                                             "(never pays, deletes or contacts anyone)", default_yes=True)
-                r = qa.run_session(target, self.client, self.ctx.io, allow_submit=allow)
+                r = qa.run_request(cmd, self.client, self.ctx.io, allow, self.ctx.planner)
                 if r.get("report"):
                     subprocess.run(["open", r["report"]["html"]], check=False)
                 return

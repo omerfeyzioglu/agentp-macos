@@ -1907,11 +1907,10 @@ def main():
             continue
         try:
             import qa
-            target = qa.test_target(cmd)
-            if target:   # "test example.com": exploratory functional testing
-                allow = ctx.io.confirm(f"Fill forms on {target} with made-up test data and submit them? "
+            if qa.TEST_REQUEST.search(cmd):   # "test example.com", "test this page", "test the login page of x.com"
+                allow = ctx.io.confirm("Fill forms with made-up test data and submit them? "
                                        "(never pays, deletes or contacts anyone)", default_yes=True)
-                r = qa.run_session(target, client, ctx.io, allow_submit=allow)
+                r = qa.run_request(cmd, client, ctx.io, allow, ctx.planner)
                 if r.get("report"):
                     subprocess.run(["open", r["report"]["html"]], check=False)
                 continue

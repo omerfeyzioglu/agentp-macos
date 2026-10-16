@@ -251,7 +251,7 @@ class Gemini:
 
     # ------------------------------------------------ exploratory testing (qa.py)
     def test_ideas(self, site: str, page: dict, tested: list[str], visited: list[str],
-                   max_tests: int, allow_submit: bool) -> dict:
+                   max_tests: int, allow_submit: bool, has_account: bool = False, focus: str = "") -> dict:
         """Act as a QA engineer on one page: what does it do, which functional tests are worth
         running here (with concrete steps and the expected result), and which pages to explore next."""
         system = f"""You are a senior QA engineer doing exploratory functional testing of {site}.
@@ -272,6 +272,16 @@ Given the current page (title, URL, headings, links, buttons, fields), return:
 - next_pages: up to 3 links (exact labels from the list) leading to important unvisited pages, most
   important first.
 
+Forms: page.form_fields lists every field with its kind (text, email, password, phone, date, number,
+textarea, select, checkbox, radio) and whether it is required. For a form test put the data in "fill":
+one entry per field, "field" = the exact field label from form_fields, "value" = what to enter (for a
+select the option text, for a checkbox "check" or "uncheck", "" to leave a field empty on purpose). Use
+realistic values that fit each field's kind. Then "steps" only submits (e.g. "click the 'Register'
+button"). Cover one fully valid submission and the invalid cases that matter for that form: required
+fields left empty, malformed email, too short password, letters in a number field.
+{"A test account exists: for login forms use the values {{username}} and {{password}} exactly as written."
+ if has_account else "No test account is available: test login forms only with wrong credentials."}
+
 Rules: stay on {site}. Use made-up test data only (names like "QA Tester", emails at example.com,
 phone 5550000000). Never pay, buy, place orders, delete, unsubscribe, log out, change account settings,
 post publicly, or contact real people. {"Submitting forms with test data is allowed." if allow_submit
@@ -285,6 +295,8 @@ another page (the crawler visits pages by itself): test what the page DOES."""
                 "tests": {"type": "array", "items": {"type": "object", "properties": {
                     "title": {"type": "string"},
                     "kind": {"type": "string", "enum": ["navigation", "form", "search", "interaction", "content"]},
+                    "fill": {"type": "array", "items": {"type": "object", "properties": {
+                        "field": {"type": "string"}, "value": {"type": "string"}}, "required": ["field", "value"]}},
                     "steps": {"type": "array", "items": {"type": "string"}},
                     "expect": {"type": "string"}},
                     "required": ["title", "kind", "steps", "expect"]}},
@@ -293,11 +305,25 @@ another page (the crawler visits pages by itself): test what the page DOES."""
             },
             "required": ["page_purpose", "tests", "next_pages"],
         }
-        prompt = json.dumps({"page": page, "already_tested": tested[-40:], "visited_pages": visited[-30:]},
-                            ensure_ascii=False)
+        req = {"page": page, "already_tested": tested[-40:], "visited_pages": visited[-30:]}
+        if focus:
+            req["user_focus"] = f"The user asked to test: {focus}. All tests must be about that."
+        prompt = json.dumps(req, ensure_ascii=False)
         out = self._json(system, prompt, schema)
-        out["tests"] = [t for t in out.get("tests", []) if t.get("steps") and t.get("expect")][:max_tests]
+        out["tests"] = [t for t in out.get("tests", []) if (t.get("steps") or t.get("fill")) and t.get("expect")][:max_tests]
         return out
+
+    def qa_request(self, cmd: str, current_url: str) -> dict:
+        """'test the login page of github.com' / 'bu sayfayı test et' → site, page and focus."""
+        system = ("Parse a request to test a website (any language). Return JSON: site = the site's address or "
+                  "name if one is mentioned (else empty); this_page = true if it refers to the page that is open now "
+                  "('this page', 'bu sayfa', 'buradaki form'); page_hint = the specific page or part to go to (e.g. "
+                  "'login', 'kayıt ol', 'pricing', 'contact form'), empty for the whole site; focus = what to test, "
+                  "in English, e.g. 'the registration form' or 'search and filters', empty for everything.")
+        schema = {"type": "object", "properties": {"site": {"type": "string"}, "this_page": {"type": "boolean"},
+                                                   "page_hint": {"type": "string"}, "focus": {"type": "string"}},
+                  "required": ["site", "this_page", "page_hint", "focus"]}
+        return self._json(system, json.dumps({"request": cmd, "open_page": current_url}, ensure_ascii=False), schema)
 
     def judge(self, expectation: str, screen: dict) -> tuple[bool, str]:
         """Second opinion when Jev is unsure whether an expected result is on screen."""

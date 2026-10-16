@@ -77,12 +77,21 @@ flowchart LR
 
 ## Functional testing
 
-Give AgentP a site and it tests it the way a QA engineer would, with no script to write:
+Tell AgentP what to test in your own words, in the panel (⌥Space), and it tests it the way a QA engineer would, with no script to write:
 
-```bash
-./run.sh --test example.com                       # or in the panel: "test example.com"
-./run.sh --test https://shop.example.com --pages 8 --minutes 20 --no-submit
-```
+| In the panel | What it tests |
+|---|---|
+| `test example.com` | The whole site: up to 6 pages, 3 tests per page |
+| `test the login page of github.com` · `github.com'un giriş sayfasını test et` | Finds that page from the home page and tests only it |
+| `test the checkout form on shop.example.com` | Focuses every test on that feature |
+| `test this page` · `bu sayfayı test et` · `buradaki formu test et` | The page open in the browser right now |
+| `test shop.example.com/pricing` | That exact page |
+
+From the terminal: `./run.sh --test example.com --pages 8 --minutes 20 --no-submit --user qa@example.com`.
+
+**Forms.** Every field is read with its kind (text, email, password, phone, date, number, textarea, select, checkbox, radio) and whether it is required. Gemini writes realistic test data per field and covers one valid submission plus the invalid cases that matter (required fields empty, malformed email, short password, letters in a number). Fields are filled directly by label, without a decision step per field; selects are chosen, checkboxes ticked, fields deliberately left empty for validation tests.
+
+**Test account.** For login-protected areas set `AGENTP_TEST_USER` / `AGENTP_TEST_PASSWORD` (or `--user`). Gemini never sees the credentials, only the placeholders `{{username}}` / `{{password}}`; the values are filled in locally and the password is masked in every report.
 
 For each page, starting from the address and staying on that site:
 

@@ -53,10 +53,14 @@ ERROR_RE = re.compile(
 HARD_STOP = re.compile(r"\b(pay|payment|buy|purchase|place order|checkout|check out|subscribe|unsubscribe|"
                        r"delete (my |your |the )?account|close (my |your )?account|deactivate|log ?out|sign ?out|"
                        r"send money|transfer)\b", re.I)
-TEST_REQUEST = re.compile(r"^\s*(test|qa)\s+(\S+)|"
-                          r"\b(test|qa)\b.*\b(feature|function|functionality|site|website|page)s?\b|"
-                          r"fonksiyon(el)? test|functional test", re.I)
-URL_IN = re.compile(r"(https?://\S+|\b[\w-]+(\.[\w-]+)+\.[a-z]{2,}\S*|\b[\w-]+\.(com|net|org|io|ai|dev|app|co|tr|edu|gov)\b\S*)", re.I)
+TEST_REQUEST = re.compile(r"^\s*(test|qa)\b|\b(test|qa) (this|the|it|that|its|my|our)\b|"
+                          r"\b(test|qa)\b.*\b(feature|function|functionality|site|website|page|form)s?\b|"
+                          r"\btest (et|eder|edin|edebilir|yap)|\btestini|\btestlerini|fonksiyon(el)? test|"
+                          r"functional test|\bqa\b", re.I)
+URL_IN = re.compile(r"(https?://[^\s'’\"]+|\b[\w-]+(\.[\w-]+)+\.[a-z]{2,}(/[^\s'’\"]*)?|"
+                    r"\b[\w-]+\.(com|net|org|io|ai|dev|app|co|tr|edu|gov)\b(/[^\s'’\"]*)?)", re.I)   # stops at "'un"
+GENERIC_FOCUS = re.compile(r"^\s*((the )?(whole |entire )?(site|website)|everything|all( the)? features|"
+                           r"(functional |function )?test(s|ing)?|functionality|features?)\s*$", re.I)
 
 
 # ---------------------------------------------------------------- talking to the user
@@ -166,6 +170,50 @@ def element_url(it: dict) -> str | None:
         return str(u) if u else None
 
 
+FIELD_ROLES = agent.TEXT_ROLES | {"AXPopUpButton", "AXCheckBox", "AXRadioButton"}
+
+
+def field_kind(it: dict) -> str:
+    el, role = it.get("el"), it["role"]
+    sub = str(agent.ax(el, "AXSubrole") or "") if el is not None else ""
+    desc = str(agent.ax(el, "AXRoleDescription") or "").casefold() if el is not None else ""
+    text = (it["label"] + " " + desc).casefold()
+    if role == "AXCheckBox":
+        return "checkbox"
+    if role == "AXRadioButton":
+        return "radio"
+    if role in ("AXPopUpButton", "AXComboBox"):
+        return "select"
+    if "secure" in sub.casefold() or "password" in text or "şifre" in text:
+        return "password"
+    if role == "AXTextArea":
+        return "textarea"
+    for kind, words in (("email", ("email", "e-mail", "e-posta")), ("phone", ("phone", "telefon", "tel")),
+                        ("date", ("date", "tarih", "birthday")), ("number", ("number", "quantity", "age", "zip",
+                                                                            "postal", "adet")),
+                        ("search", ("search", "ara"))):
+        if any(w in text for w in words):
+            return kind
+    return "text"
+
+
+def form_fields(items: list[dict]) -> list[dict]:
+    out = []
+    for it in items:
+        if not it.get("page") or it["role"] not in FIELD_ROLES:
+            continue
+        el = it.get("el")
+        f = {"field": it["label"][:70], "kind": field_kind(it)}
+        if el is not None and agent.ax(el, "AXRequired"):
+            f["required"] = True
+        if f["kind"] in ("select", "checkbox", "radio") and el is not None:
+            v = agent.ax(el, "AXValue")
+            if v is not None:
+                f["current"] = str(v)[:40]
+        out.append(f)
+    return out[:40]
+
+
 def snapshot(app: str) -> dict:
     """Everything a QA engineer would note about the page, from its accessibility tree."""
     items = agent.read_screen(app)
@@ -187,6 +235,7 @@ def snapshot(app: str) -> dict:
         "buttons": [i["label"][:60] for i in page if i["role"] in ("AXButton", "AXMenuButton", "AXPopUpButton",
                                                                    "AXCheckBox", "AXRadioButton", "AXTab")][:60],
         "fields": [i["label"][:60] for i in page if i["role"] in agent.TEXT_ROLES][:30],
+        "form_fields": form_fields(items),
         "texts": [i["label"][:160] for i in page if i["role"] in agent.READ_ROLES][:200],
     }
 
@@ -255,6 +304,25 @@ def check(client, gem, app: str, expectation: str) -> tuple[str, float, str]:
 
 
 # ---------------------------------------------------------------- one session
+def test_account() -> dict | None:
+    import os
+    user, pw = os.environ.get("AGENTP_TEST_USER"), os.environ.get("AGENTP_TEST_PASSWORD")
+    return {"username": user, "password": pw or ""} if user else None
+
+
+def secret(text: str, account: dict | None) -> str:
+    """Put the test account into planned text."""
+    if account:
+        text = text.replace("{{username}}", account["username"]).replace("{{password}}", account["password"])
+    return text
+
+
+def masked(text: str, account: dict | None) -> str:
+    if account and account.get("password"):
+        text = text.replace(account["password"], "••••••")
+    return text
+
+
 def resolve_target(target: str, gem) -> str | None:
     target = target.strip().strip("'\"")
     if re.match(r"^https?://", target):
@@ -273,7 +341,11 @@ def resolve_target(target: str, gem) -> str | None:
 
 
 def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 15, tests_per_page: int = 3,
-                allow_submit: bool = True, out_dir: Path | None = None) -> dict:
+                allow_submit: bool = True, out_dir: Path | None = None, account: dict | None = None,
+                focus: str = "", page_hint: str = "") -> dict:
+    """account: {"username": ..., "password": ...} of a TEST account on the site under test. Gemini only
+    sees the placeholders {{username}} / {{password}}; values are filled in locally and masked in reports."""
+    account = account or test_account()
     t_start = time.time()
     ctx = agent.make_ctx(io=None, use_memory=False)
     gem = ctx.planner
@@ -295,7 +367,15 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
               "allow_submit": allow_submit, "pages": [], "tests": [], "issues": []}
     issue = lambda sev, page, what, detail="", shot=None: result["issues"].append(  # noqa: E731
         {"severity": sev, "page": page, "what": what, "detail": detail, "screenshot": shot})
-    io.progress(f"› Testing {scope} in {app} (up to {pages} pages, {minutes:.0f} min)")
+    what = f"{focus} on {scope}" if focus else (f"the {page_hint} page of {scope}" if page_hint else scope)
+    io.progress(f"› Testing {what} in {app}" + (f" (up to {pages} pages, {minutes:.0f} min)" if pages > 1 else ""))
+    if page_hint:   # "the login page of github.com": find it from the start page
+        goto(app, url)
+        found = pick_link(client, app, f"{page_hint} ({focus})" if focus else page_hint, snapshot(app))
+        if found:
+            url = found
+        else:
+            io.progress(f"  (no link to a '{page_hint}' page on the start page; testing the start page)")
 
     queue, visited, tested = [url], [], []
     link_pool = ThreadPoolExecutor(8)
@@ -336,9 +416,10 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
         ideas = {"page_purpose": "", "tests": [], "next_pages": []}
         if gem is not None:
             try:
-                ideas = gem.test_ideas(scope, {k: snap[k] for k in ("url", "title", "headings", "buttons", "fields")}
+                ideas = gem.test_ideas(scope, {k: snap[k] for k in ("url", "title", "headings", "buttons", "form_fields")}
                                        | {"links": [l["label"] for l in snap["links"]], "texts": snap["texts"][:60]},
-                                       tested, visited, tests_per_page, allow_submit)
+                                       tested, visited, tests_per_page, allow_submit, bool(account),
+                                       focus or (f"the {page_hint} page" if page_hint else ""))
             except Exception as e:
                 io.progress(f"  (could not plan tests here: {str(e)[:80]})")
         page["purpose"] = ideas.get("page_purpose", "")
@@ -347,7 +428,8 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
                 break
             if n > 0 or norm(current_url(app) or "") != norm(landed):
                 goto(app, landed)   # every test starts from the page itself
-            result["tests"].append(run_test(client, gem, ctx, io, app, landed, test, out_dir, len(result["tests"]) + 1))
+            result["tests"].append(run_test(client, gem, ctx, io, app, landed, test, out_dir,
+                                            len(result["tests"]) + 1, account))
             tested.append(f"{snap['title']}: {test['title']}")
             page["tests"] += 1
             last = result["tests"][-1]
@@ -390,21 +472,93 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     return result
 
 
-def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir: Path, number: int) -> dict:
+def best_field(name: str, fields: list[dict]) -> dict | None:
+    """The form field whose label best matches the planned field name."""
+    if not fields:
+        return None
+    want = [w for w in agent.tokens(name) if len(w) > 1]
+
+    def score(it):
+        have = agent.tokens(it["label"])
+        overlap = sum(1 for w in want if any(h.startswith(w[:5]) or w.startswith(h[:5]) for h in have if len(h) > 1))
+        coverage = overlap / len(want) if want else 0
+        ratio = agent.difflib.SequenceMatcher(None, name.casefold(), it["label"].casefold()[:len(name) + 20]).ratio()
+        # most of the planned name must be in the label ("Credit card number" is not "Mobile Number")
+        return coverage + ratio if coverage >= 0.6 or ratio >= 0.85 else 0
+
+    best = max(fields, key=score)
+    return best if score(best) > 0 else None
+
+
+def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[str]:
+    """Fill fields straight from the plan (no decision loop per field). Returns what was done;
+    raises RuntimeError when a field cannot be found or filled."""
+    done = []
+    for f in fills:
+        name, value = f.get("field", ""), secret(str(f.get("value", "")), account)
+        fields = [i for i in agent.read_screen(app) if i.get("page") and i["role"] in FIELD_ROLES]
+        it = best_field(name, fields)
+        if it is None:
+            raise RuntimeError(f"no field like '{name}' on the page")
+        kind = field_kind(it)
+        if kind in ("checkbox", "radio"):
+            want = value.casefold() not in ("uncheck", "unchecked", "false", "no", "0", "off")
+            on = str(agent.ax(it["el"], "AXValue")) in ("1", "True", "true")
+            if want != on or kind == "radio":
+                agent.press(it, ctx)
+            done.append(f"{'checked' if want else 'unchecked'} '{it['label'][:40]}'")
+        elif kind == "select":
+            agent.press(it, ctx)
+            time.sleep(0.6)
+            opts = [i for i in agent.read_screen(app) if i.get("popup")]
+            pick = max(opts, key=lambda o: agent.difflib.SequenceMatcher(None, value.casefold(),
+                                                                          o["label"].casefold()).ratio(), default=None)
+            if pick is not None and agent.difflib.SequenceMatcher(None, value.casefold(), pick["label"].casefold()).ratio() > 0.5:
+                agent.press(pick, ctx)
+            else:   # web selects without a readable list: type the option and confirm
+                agent.paste_text(value, ctx)
+                agent.key(36, ctx)
+            done.append(f"selected '{value[:40]}' in '{it['label'][:40]}'")
+        elif value == "":
+            agent.execute({"action": "type", "element": it, "text": " "}, name, ctx)
+            agent.keystroke(ctx, "a", ["command"])
+            agent.key(51, ctx)   # leave it empty on purpose (validation tests)
+            done.append(f"cleared '{it['label'][:40]}'")
+        else:
+            agent.execute({"action": "type", "element": it, "text": value}, f"type {name}", ctx)
+            shown = "••••••" if kind == "password" or (account and value == account.get("password")) else value[:40]
+            done.append(f"filled '{it['label'][:40]}' = {shown}")
+        time.sleep(0.2)
+    return done
+
+
+def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir: Path, number: int,
+             account: dict | None = None) -> dict:
     t0 = time.time()
     io.lines, io.blocked = [], []
     ctx.history.clear()
-    rec = {"page": page_url, "title": test["title"], "kind": test.get("kind", ""), "steps": test["steps"],
+    rec = {"page": page_url, "title": test["title"], "kind": test.get("kind", ""),
+           "steps": [masked(secret(s, account), account) for s in test["steps"]],
            "expect": test["expect"], "status": "", "confidence": None, "note": "", "agent_steps": [],
            "screenshot": None}
     io.progress(f"    ▸ {test['title']}")
-    for step in test["steps"]:
+    rec["fill"] = [{"field": f.get("field"), "value": masked(secret(str(f.get("value", "")), account), account)}
+                   for f in test.get("fill") or []]
+    if test.get("fill"):
+        try:
+            rec["agent_steps"] += [f"fill → {s}" for s in fill_form(test["fill"], ctx, app, account)]
+        except Exception as e:
+            rec["agent_steps"].append(f"fill → FAILED ({e})")
+            rec["status"], rec["note"] = "error", f"Could not fill the form: {e}"
+    for step in ([] if rec["status"] else test["steps"]):
+        step = secret(step, account)
         blocked_before = len(io.blocked)
         try:
             r = agent.handle(client, step, ctx)
         except Exception as e:
             r = {"ok": False, "steps": [f"error: {e}"]}
-        rec["agent_steps"] += [f"{step} → {s}" for s in r.get("steps", [])] or [f"{step} → (nothing done)"]
+        shown = masked(step, account)
+        rec["agent_steps"] += [masked(f"{shown} → {s}", account) for s in r.get("steps", [])] or [f"{shown} → (nothing done)"]
         if len(io.blocked) > blocked_before and HARD_STOP.search(io.blocked[-1]):
             rec["status"] = "blocked"
             rec["note"] = f"Not run for safety: '{step}' needs '{io.blocked[-1][:80]}'"
@@ -412,7 +566,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
         if not r.get("ok"):
             rec["status"] = "error"
             why = io.blocked[-1] if io.blocked else (r.get("steps") or ["could not be done"])[-1]
-            rec["note"] = f"Step could not be completed: '{step}' — {why}"
+            rec["note"] = masked(f"Step could not be completed: '{step}' — {why}", account)
             break
     if not rec["status"]:
         rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, test["expect"])
@@ -466,6 +620,7 @@ def html_report(r: dict) -> str:
         f'<details class="test {e(t["status"])}"><summary><span class="dot"></span><b>{e(t["title"])}</b>'
         f'<span class="muted"> · {e(t["kind"])} · {t.get("duration_s", 0)} s</span><span class="st">{e(t["status"])}</span></summary>'
         f'<div class="body"><div class="muted url">{e(t["page"])}</div>'
+        f'{"<h4>Form data</h4><ul>" + "".join("<li>" + e(f["field"]) + " = " + (e(f["value"]) or "<i>empty</i>") + "</li>" for f in t.get("fill", [])) + "</ul>" if t.get("fill") else ""}'
         f'<h4>Steps</h4><ul>{"".join("<li>" + e(s) + "</li>" for s in t["steps"])}</ul>'
         f'<h4>Expected</h4><p>{e(t["expect"])}</p>'
         f'{"<h4>Result</h4><p>" + e(t["note"]) + "</p>" if t["note"] else ""}'
@@ -518,6 +673,63 @@ a{{color:inherit}}
 
 
 # ---------------------------------------------------------------- entry points
+def parse_request(cmd: str, gem) -> dict | None:
+    """A test request in the user's words → {site, this_page, page_hint, focus}. None if it is not one."""
+    if not TEST_REQUEST.search(cmd):
+        return None
+    app = browser()
+    open_url = current_url(app) if agent.find_running(app) else ""
+    req = {"site": test_target(cmd) or "", "this_page": False, "page_hint": "", "focus": ""}
+    if gem is not None:
+        try:
+            req = gem.qa_request(cmd, open_url) | ({"site": req["site"]} if req["site"] else {})
+        except Exception:
+            pass
+    if GENERIC_FOCUS.match(req.get("focus") or ""):
+        req["focus"] = ""   # "do the functional tests" = everything
+    if req.get("site"):
+        m = URL_IN.search(req["site"])
+        req["site"] = m.group(0) if m else req["site"].split("'")[0].split("’")[0]
+    if req.get("site") and urllib.parse.urlsplit(("https://" if "://" not in req["site"] else "") + req["site"]).path.strip("/"):
+        req["page_hint"], req["single_page"] = "", True   # a full page address: test that page
+    if req.get("this_page"):
+        if not open_url.startswith("http"):
+            return {"error": "No web page is open in the browser to test."}
+        req["site"], req["page_hint"] = open_url, ""   # "the form here": it is on this page
+    if not req.get("site"):
+        return {"error": "Which site? Say e.g. 'test example.com' or open the page and say 'test this page'."}
+    return req
+
+
+def pick_link(client, app: str, hint: str, snap: dict) -> str | None:
+    """The link that leads to the page the user named ('login', 'kayıt ol'): Jev chooses among the links."""
+    from typesafe_sdk import Choice
+    links = [l for l in snap["links"] if l.get("url")][:120]
+    if not links:
+        return None
+    opts = {f"l{i}": f"{l['label']} ({urllib.parse.urlsplit(l['url']).path})" for i, l in enumerate(links)}
+    opts["none"] = "None of these"
+    a = agent.jev(client, {"user_wants_page": hint, "site": snap["url"]},
+                  {"link": Choice(instructions=f"Which link opens the '{hint}' page?", criteria=opts)}, {}, "link")
+    ch = a["link"]
+    return links[int(ch.choice[1:])]["url"] if ch.choice != "none" and ch.confidence >= 0.4 else None
+
+
+def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None) -> dict:
+    """Panel / terminal entry: understand the request, then test the site, a page of it, or this page."""
+    req = parse_request(cmd, gem)
+    if req is None:
+        return {}
+    if req.get("error"):
+        base_io.say(f"✗ {req['error']}")
+        return {}
+    focused = bool(req.get("this_page") or req.get("page_hint") or req.get("focus"))
+    single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
+    return run_session(req["site"], client, base_io, pages=1 if single else 6,
+                       tests_per_page=5 if focused else 3, allow_submit=allow_submit,
+                       focus=req.get("focus", ""), page_hint=req.get("page_hint", ""))
+
+
 def test_target(cmd: str) -> str | None:
     """'test example.com', 'go to example.com and test its features' → 'example.com'. None if not a test request."""
     if not TEST_REQUEST.search(cmd):
@@ -538,6 +750,8 @@ def main():
     ap.add_argument("--no-submit", action="store_true", help="never submit forms, only test validation")
     ap.add_argument("--yes", action="store_true", help="do not ask before starting (CI)")
     ap.add_argument("--out", help="report directory (default ~/.agentp/qa/<time>-<site>)")
+    ap.add_argument("--user", help="username / email of a TEST account on the site (for login tests)")
+    ap.add_argument("--password", help="its password (asked hidden if --user is given without it)")
     args = ap.parse_args()
     agent.check_env()
     if not agent.AXIsProcessTrusted():
@@ -547,9 +761,13 @@ def main():
         a = input(f"AgentP will click through {args.site}, fill forms with made-up test data and submit them.\n"
                   "It never pays, buys, deletes, logs out or contacts anyone. Allow form submission? (Y/n) ")
         allow = a.strip().casefold() in ("", "y", "yes")
+    account = None
+    if args.user:
+        from getpass import getpass
+        account = {"username": args.user, "password": args.password or getpass("Test account password: ")}
     from typesafe_sdk import TypeSafeClient
     r = run_session(args.site, TypeSafeClient(), agent.CliIO(), args.pages, args.minutes, args.tests, allow,
-                    Path(args.out) if args.out else None)
+                    Path(args.out) if args.out else None, account)
     if r.get("report"):
         subprocess.run(["open", r["report"]["html"]], check=False)
     bad = [t for t in r.get("tests", []) if t["status"] in ("failed", "error")]
