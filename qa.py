@@ -763,7 +763,7 @@ FILLER = set("""test tests testi testini testleri testlerini testlerin et eder e
 yapın yapabilir fonksiyon fonksiyonel fonksiyonları fonksiyonlarını functional function functions feature features
 özellik özellikleri özelliklerini the of on at in for and its please lütfen site sitesi sitesinin sitesinde
 website web page sayfa sayfası sayfasını sayfasının sayfayı nin nın nun nün in ın un ün de da için ve qa check
-kontrol tüm bütün whole all everything bu şu buradaki burada here this current these şuradaki""".split())
+kontrol tüm bütün whole all everything bu şu buradaki burada here this current these şuradaki go to it git gir open aç""".split())
 PATH_SEP = re.compile(r"\s*(?:>|→|->|»| sonra | then )\s*", re.I)
 
 
