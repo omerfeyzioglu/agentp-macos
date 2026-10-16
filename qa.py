@@ -408,6 +408,16 @@ def screenshot(app: str, path: Path) -> str | None:
 
 
 # ---------------------------------------------------------------- checking a result
+NEGATIVE = re.compile(r"does not (move|advance|proceed|go)|not (move|advance|proceed)|stays? on|remains? on", re.I)
+
+
+def split_expectation(expect: str) -> tuple[str, str]:
+    """'the form does not move on … and a message about Plaka is shown' → the outcome that decides the test,
+    and the feedback that is good UX but not the function itself."""
+    m = re.match(r"(.*?\b(?:does not|not) (?:move|advance|proceed|go)[^,;]*?)\s*(?:,|;| and )\s*(.+)$", expect, re.I)
+    return (m.group(1).strip(), re.sub(r"^and\s+", "", m.group(2).strip())) if m else (expect, "")
+
+
 def check(client, gem, app: str, expectation: str, before: dict | None = None) -> tuple[str, float, str]:
     """Is the expected result on screen? Jev answers yes/no with a probability; polled for a few
     seconds (results appear asynchronously); Gemini decides only when Jev stays unsure."""
@@ -505,7 +515,8 @@ def follow_up(client, gem, ctx, io, app, page_url, prefix, result, tested, visit
                                | {"links": [l["label"] for l in snap["links"]], "texts": snap["texts"][:60]},
                                tested, visited, FOLLOW_UPS, allow_submit, bool(account),
                                f"the state reached after: {' → '.join(t['title'] for t in prefix)} "
-                               "(e.g. the next step of the form); test only what is new there")
+                               "(e.g. the next step of the form); test only what is new there, and include one "
+                               "test that validly completes this state and moves on (advances=true)")
     except Exception as e:
         io.progress(f"  (could not plan follow-up tests: {str(e)[:60]})")
         return
@@ -515,6 +526,9 @@ def follow_up(client, gem, ctx, io, app, page_url, prefix, result, tested, visit
         goto(app, page_url)   # each follow-up starts clean: page, then the tests that led here
         rec = run_test(client, gem, ctx, io, app, page_url, test, out_dir, len(result["tests"]) + 1, account, prefix)
         result["tests"].append(rec)
+        if rec.get("ux"):
+            result["issues"].append({"severity": "low", "page": page_url, "what": "No feedback for invalid input",
+                                     "detail": f"{test['title']}: {rec['ux']}", "screenshot": None})
         tested.append(f"{' → '.join(t['title'] for t in prefix)} → {test['title']}")
         if rec["status"] == "passed" and test.get("advances"):
             follow_up(client, gem, ctx, io, app, page_url, prefix + [test], result, tested, visited, out_dir,
@@ -647,7 +661,9 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
             tested.append(f"{snap['title']}: {test['title']}")
             page["tests"] += 1
             last = result["tests"][-1]
-            for s in last["agent_steps"]:
+            if last.get("ux"):
+                issue("low", landed, "No feedback for invalid input", f"{test['title']}: {last['ux']}")
+            for s in last["agent_steps"] if not (NEGATIVE.search(test["expect"]) or last.get("adapted")) else []:
                 if "no change on screen" in s:
                     issue("medium", landed, "A control did nothing when used", f"{test['title']}: {s}", last.get("screenshot"))
             if not in_scope():
@@ -915,6 +931,28 @@ def prepare(test: dict, prefix: list[dict], page_url: str, client, ctx, app: str
             + ", ".join(start_markers(test)) + "). " + screen_note(app, []))
 
 
+def stopped_now(ctx) -> bool:
+    return bool(ctx.stop and ctx.stop())
+
+
+def adapt(client, gem, ctx, io, app: str, test: dict) -> list[str]:
+    """The scripted steps did not reach the expected result. Do what a person would: look at the page
+    and finish the goal with what it offers (pick from a suggestion list, choose an option, confirm).
+    Uses the full agent (planner on) for a few steps; returns what it did."""
+    goal = (f"On this page, reach this goal: {test['title']}. The expected result is: {test['expect']}. "
+            "Some steps were already done: " + "; ".join(test.get("steps", [])) + ". Use what the page shows "
+            "now (a suggestion list, an option, a button) to finish. Use made-up test data only.")
+    saved, ctx.planner = ctx.planner, gem
+    io.progress("       ↺ adapting to the page")
+    try:
+        r = agent.handle(client, goal, ctx)
+        return [s for s in r.get("steps", []) if s]
+    except Exception:
+        return []
+    finally:
+        ctx.planner = saved
+
+
 def replay(prefix: list[dict], client, ctx, app: str, account: dict | None) -> bool:
     """Bring the page back to the state a follow-up test starts from: redo the tests that led there."""
     for t in prefix:
@@ -985,13 +1023,31 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
     if not rec["status"]:
         if WINDOW is not None:
             WINDOW.ensure_front()
-        rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, test["expect"], before)
+        hard, soft = split_expectation(test["expect"])
+        rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, hard, before)
+        if rec["status"] == "passed" and soft:   # the function works; is the user told why?
+            st, _, _ = check(client, gem, app, soft, before)
+            if st != "passed":
+                rec["ux"] = f"No visible feedback: expected '{soft}'"
+        elif rec["status"] == "failed" and gem is not None and not NEGATIVE.search(hard) and not stopped_now(ctx):
+            adapted = adapt(client, gem, ctx, io, app, test)   # a person would use what the page shows
+            if adapted:
+                rec["agent_steps"] += [f"adapted → {s}" for s in adapted]
+                st, conf, note = check(client, gem, app, hard, before)
+                if st == "passed":
+                    rec["status"], rec["confidence"] = "passed", conf
+                    rec["note"] = "Reached by adapting to the page: " + "; ".join(adapted[-4:])
+                    rec["adapted"] = True
     if rec["status"] != "passed":
         rec["screenshot"] = screenshot(app, out_dir / f"test{number}.png")
     rec["duration_s"] = round(time.time() - t0, 1)
     mark = {"passed": "✓", "failed": "✗", "error": "✗", "blocked": "–"}[rec["status"]]
+    if rec.get("adapted"):
+        rec["status_label"] = "passed (adapted)"
     conf = f" ({rec['confidence']:.2f})" if rec["confidence"] is not None else ""
-    io.progress(f"     {mark} {rec['status']}{conf}" + (f" — {rec['note']}" if rec["status"] != "passed" else ""))
+    io.progress(f"     {mark} {rec.get('status_label', rec['status'])}{conf}"
+                + (f" — {rec['note']}" if rec["status"] != "passed" else "")
+                + (f" · {rec['ux']}" if rec.get("ux") else ""))
     return rec
 
 
@@ -1032,22 +1088,40 @@ def html_report(r: dict) -> str:
         f'<td class="url">{e(i["page"])}</td>'
         f'<td>{"<a href=" + chr(34) + e(i["screenshot"]) + chr(34) + ">image</a>" if i.get("screenshot") else ""}</td></tr>'
         for i in issues) or '<tr><td colspan="4" class="muted">No issues found.</td></tr>'
-    tests = "".join(
+    def group(t):
+        return "After: " + t["after"] if t.get("after") else "Starting state"
+    ordered = sorted(r["tests"], key=lambda t: (len(t.get("after", "").split(" → ")) if t.get("after") else 0, group(t)))
+    heads, tests = set(), ""
+    for t in ordered:
+        if group(t) not in heads:
+            heads.add(group(t))
+            tests += f'<h3 class="state">{e(group(t))}</h3>'
+        tests += one_test(t)
+    tests = tests or '<p class="muted">No tests were run.</p>'
+    pages = "".join(
+        f'<tr><td>{e(p["title"] or p["url"])}<div class="muted url">{e(p["url"])}</div></td><td>{e(p["purpose"])}</td>'
+        f'<td>{e(p["status"])}</td><td>{p["load_ms"] / 1000:.1f} s</td><td>{p["tests"]}</td></tr>' for p in r["pages"])
+    return page_html(r, e, passed, failed, issue_rows, tests, pages)
+
+
+def one_test(t: dict) -> str:
+    e = lambda s: html.escape(str(s or ""))  # noqa: E731
+    return (
         f'<details class="test {e(t["status"])}"><summary><span class="dot"></span><b>{e(t["title"])}</b>'
-        f'<span class="muted"> · {e(t["kind"])} · {t.get("duration_s", 0)} s</span><span class="st">{e(t["status"])}</span></summary>'
+        f'<span class="muted"> · {e(t["kind"])} · {t.get("duration_s", 0)} s</span><span class="st">{e(t.get("status_label", t["status"]))}</span></summary>'
         f'<div class="body"><div class="muted url">{e(t["page"])}</div>'
         f'{"<p class=muted>Starts after: " + e(t["after"]) + "</p>" if t.get("after") else ""}'
         f'{"<h4>Form data</h4><ul>" + "".join("<li>" + e(f["field"]) + " = " + (e(f["value"]) or "<i>empty</i>") + "</li>" for f in t.get("fill", [])) + "</ul>" if t.get("fill") else ""}'
         f'<h4>Steps</h4><ul>{"".join("<li>" + e(s) + "</li>" for s in t["steps"])}</ul>'
         f'<h4>Expected</h4><p>{e(t["expect"])}</p>'
         f'{"<h4>Result</h4><p>" + e(t["note"]) + "</p>" if t["note"] else ""}'
+        f'{"<h4>UX</h4><p>" + e(t["ux"]) + "</p>" if t.get("ux") else ""}'
         f'{"<p class=muted>Confidence " + format(t["confidence"], ".2f") + "</p>" if t["confidence"] is not None else ""}'
         f'<h4>What the agent did</h4><ul class="mono">{"".join("<li>" + e(s) + "</li>" for s in t["agent_steps"])}</ul>'
-        f'{"<img src=" + chr(34) + e(t["screenshot"]) + chr(34) + ">" if t.get("screenshot") else ""}</div></details>'
-        for t in r["tests"]) or '<p class="muted">No tests were run.</p>'
-    pages = "".join(
-        f'<tr><td>{e(p["title"] or p["url"])}<div class="muted url">{e(p["url"])}</div></td><td>{e(p["purpose"])}</td>'
-        f'<td>{e(p["status"])}</td><td>{p["load_ms"] / 1000:.1f} s</td><td>{p["tests"]}</td></tr>' for p in r["pages"])
+        f'{"<img src=" + chr(34) + e(t["screenshot"]) + chr(34) + ">" if t.get("screenshot") else ""}</div></details>')
+
+
+def page_html(r: dict, e, passed: int, failed: int, issue_rows: str, tests: str, pages: str) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>QA report · {e(r['scope'])}</title>
 <style>
@@ -1069,6 +1143,7 @@ details.test summary{{list-style:none;cursor:pointer;padding:12px 16px;display:f
 details.test summary::-webkit-details-marker{{display:none}}.st{{margin-left:auto;font-size:12px;color:var(--muted)}}
 .dot{{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}}
 .passed .dot{{background:var(--ok)}}.failed .dot,.error .dot{{background:var(--bad)}}
+h3.state{{font-size:13px;font-weight:600;color:var(--muted);margin:22px 0 6px}}
 .body{{padding:0 16px 16px 32px}}.body img{{max-width:100%;border:1px solid var(--line);border-radius:8px;margin-top:12px}}
 a{{color:inherit}}
 </style></head><body><main>

@@ -285,6 +285,10 @@ Test a form like a careful QA engineer, one rule per test:
     ID patterns, out-of-range numbers or dates, too short password;
   - a required checkbox (consent, terms) left unchecked;
   - boundaries: very long input (100+ characters), leading/trailing spaces, Turkish characters (ğüşıöç).
+Flows (multi-step forms, wizards, checkouts, search → results → detail): always include ONE test that
+completes the current step / state validly and moves on (advances=true) — choose an option, select a
+result, pick a date — so the next step can be tested too. Tests are goals: a person would adapt to what
+the page shows (a suggestion list to pick from, a confirmation), so describe the goal in the title.
 For invalid input, write "expect" as what any correct site does: "the form does not move on to the next
 step" — and, if the field has a visible rule, "and a message about <field> is shown or the field is
 marked". Sites differ: some show messages, some only keep the button from advancing.
