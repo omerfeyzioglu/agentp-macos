@@ -574,8 +574,8 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     stopped = stop or (lambda: False)
     ctx.stop = stopped
     ctx.url_opener = lambda u: WINDOW.goto(u)
-    ctx.blocked = frozenset({"quit_app", "close_tab", "close_window", "new_window", "new_tab", "reopen_tab",
-                             "minimize", "fullscreen"})
+    ctx.blocked = frozenset({"open_app", "quit_app", "close_tab", "close_window", "new_window", "new_tab",
+                             "reopen_tab", "minimize", "fullscreen", "system"})
     out_dir = out_dir or QA_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{scope}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -655,8 +655,8 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
         for n, test in enumerate(ideas["tests"]):
             if time.time() > deadline or stopped():
                 break
-            if n > 0 or norm(current_url(app) or "") != norm(landed):
-                goto(app, landed)   # every test starts from the page itself
+            if norm(current_url(app) or "") != norm(landed):
+                goto(app, landed)   # back to the page under test (a heavy page is not reloaded for nothing)
             result["tests"].append(run_test(client, gem, ctx, io, app, landed, test, out_dir,
                                             len(result["tests"]) + 1, account))
             test["_adapted"] = bool(result["tests"][-1].get("adapted"))
@@ -852,6 +852,23 @@ def label_candidates(text: str) -> list[str]:
     return list(dict.fromkeys(t.strip() for t in out if t.strip()))
 
 
+CONTROL_RANK = {"AXCheckBox": 5, "AXRadioButton": 5, "AXPopUpButton": 4, "AXButton": 4, "AXMenuItem": 4,
+                "AXTab": 4, "AXLink": 3, "AXGroup": 3, "AXListItem": 3, "AXGenericElement": 3, "AXSection": 3,
+                "AXArticle": 3, "AXCell": 2, "AXRow": 2, "AXStaticText": 0, "AXHeading": 0, "AXImage": 0}
+
+
+def toggled(it: dict, before) -> bool:
+    """Did a checkbox / radio / selectable card change its selected state?"""
+    el = it.get("el")
+    if el is None:
+        return True
+    for attr in ("AXValue", "AXSelected"):
+        now = agent.ax(el, attr)
+        if now is not None and before.get(attr) is not None and now != before.get(attr):
+            return True
+    return False
+
+
 def direct_step(step: str, ctx, app: str) -> list[str] | None:
     """'click the 'İLERİ' button' / 'type 'x' into the Email field': done straight from the visible label,
     without planning or interpreting the step. None if the step is not that simple or the label is not
@@ -876,20 +893,29 @@ def direct_step(step: str, ctx, app: str) -> list[str] | None:
             if not a or not b:
                 return 0
             return 3 if a == b else 2 if b.startswith(a) or a.startswith(b) else 1 if a in b else 0
-        cand = max(items, key=lambda i: (score(i), -len(i["label"])), default=None)
+        # among clear matches, the control itself (checkbox, radio, card, button) beats its caption text
+        # any control beats caption text; among controls an exact label beats a longer one, then the control kind
+        cand = max(items, key=lambda i: (score(i) >= 2, CONTROL_RANK.get(i["role"], 0) > 0, score(i),
+                                         CONTROL_RANK.get(i["role"], 0), -len(i["label"])), default=None)
         if cand is not None and score(cand) >= 2:
             best = cand
             break
     if best is None:
         return None
     before = agent.screen_signature(agent.read_screen(app))
+    el = best.get("el")
+    state0 = {a: agent.ax(el, a) for a in ("AXValue", "AXSelected")} if el is not None else {}
+    selectable = best["role"] in ("AXCheckBox", "AXRadioButton") or any(v is not None for v in state0.values())
     agent.press(best, ctx)
     after = agent.wait_for_change(app, before, timeout=2.5)
     changed = agent.screen_signature(after) != before
-    if not changed and agent.mouse_click(best):   # the element ignored AXPress: a real click
-        after = agent.wait_for_change(app, before, timeout=2.0)
+    if (not changed or (selectable and not toggled(best, state0))) and agent.mouse_click(best):
+        after = agent.wait_for_change(app, before, timeout=2.0)   # AXPress ignored: a real click
         changed = agent.screen_signature(after) != before
-    return [f"clicked '{best['label'][:50]}'" + ("" if changed else " (but no change on screen)")]
+    note = ""
+    if selectable:
+        note = " (selected state changed)" if toggled(best, state0) else " (but its selected state did not change)"
+    return [f"clicked '{best['label'][:50]}'" + ("" if changed else " (but no change on screen)") + note]
 
 
 def start_markers(test: dict) -> list[str]:
@@ -940,6 +966,10 @@ def stopped_now(ctx) -> bool:
     return bool(ctx.stop and ctx.stop())
 
 
+def worked(steps: list[str]) -> bool:
+    return any(s and "FAILED" not in s and not s.startswith("waited") for s in steps)
+
+
 def adapt(client, gem, ctx, io, app: str, test: dict) -> list[str]:
     """The scripted steps did not reach the expected result. Do what a person would: look at the page
     and finish the goal with what it offers (pick from a suggestion list, choose an option, confirm).
@@ -977,6 +1007,9 @@ def replay(prefix: list[dict], client, ctx, app: str, account: dict | None, gem=
             return False
     time.sleep(1.0)
     return True
+
+
+LOGIN_URL = re.compile(r"login|signin|sign-in|sign_in|/auth|oauth|sso\.|/giris|uye-girisi|account/log", re.I)
 
 
 def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir: Path, number: int,
@@ -1029,7 +1062,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             hard = split_expectation(test["expect"])[0]
             if gem is not None and not io.blocked and not (NEGATIVE.search(hard) or NO_ADAPT.search(hard)):
                 adapted = adapt(client, gem, ctx, io, app, test)   # this step did not work: reach the goal another way
-                if adapted:
+                if worked(adapted):
                     rec["agent_steps"] += [f"adapted → {x}" for x in adapted]
                     st, conf, _ = check(client, gem, app, hard, before)
                     if st == "passed":
@@ -1051,13 +1084,17 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
         elif rec["status"] == "failed" and gem is not None and not (NEGATIVE.search(hard) or NO_ADAPT.search(hard)) \
                 and not stopped_now(ctx):
             adapted = adapt(client, gem, ctx, io, app, test)   # a person would use what the page shows
-            if adapted:
+            if worked(adapted):
                 rec["agent_steps"] += [f"adapted → {s}" for s in adapted]
                 st, conf, note = check(client, gem, app, hard, before)
                 if st == "passed":
                     rec["status"], rec["confidence"] = "passed", conf
                     rec["note"] = "Reached by adapting to the page: " + "; ".join(adapted[-4:])
                     rec["adapted"] = True
+    now = current_url(app) or ""
+    if rec["status"] in ("failed", "error") and LOGIN_URL.search(now) and not account:
+        rec["status"] = "blocked"
+        rec["note"] = f"Needs a login: it went to {urllib.parse.urlsplit(now).netloc} (set a test account to test it)"
     if rec["status"] != "passed":
         rec["screenshot"] = screenshot(app, out_dir / f"test{number}.png")
     rec["duration_s"] = round(time.time() - t0, 1)

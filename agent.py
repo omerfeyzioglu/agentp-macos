@@ -1028,6 +1028,8 @@ def pick_action(a, apps: list, text_opts: dict, items: list, ctx: Ctx, cmd: str,
     app = apps[int(ap[1:])] if ap != "none" else None
 
     def valid(act: str) -> bool:
+        if act in ctx.blocked:
+            return False   # e.g. no opening / quitting apps during a website test
         if act == "open_app":
             return (app is not None and (app_matches(cmd, app) or app in plan_apps)) or st != "none"
         if act == "open_url":

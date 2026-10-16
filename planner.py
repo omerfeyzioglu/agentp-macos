@@ -342,8 +342,10 @@ another page (the crawler visits pages by itself): test what the page DOES."""
 
     def judge(self, expectation: str, screen: dict) -> tuple[bool, str]:
         """Second opinion when Jev is unsure whether an expected result is on screen."""
-        system = ("You check one expected result of a functional test against what is on the screen. "
-                  "Answer with JSON: {\"passed\": true|false, \"reason\": \"one short sentence\"}.")
+        system = ("You check one expected result of a functional test against what is on the screen. Pass only "
+                  "if the screen shows that the expected change actually happened (compare before_the_test with now "
+                  "when given). A control merely being present, or a price/summary that did not change, is not "
+                  "enough. Answer with JSON: {\"passed\": true|false, \"reason\": \"one short sentence\"}.")
         schema = {"type": "object", "properties": {"passed": {"type": "boolean"}, "reason": {"type": "string"}},
                   "required": ["passed", "reason"]}
         out = self._json(system, json.dumps({"expected": expectation, "screen": screen}, ensure_ascii=False), schema)
