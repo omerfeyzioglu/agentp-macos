@@ -166,13 +166,18 @@ def current_url(app: str) -> str:
 
 
 def goto(app: str, url: str) -> float:
-    """Load url in the test window. Returns the load time in ms."""
+    """Load url in the test window. Returns the load time in ms: until the browser stops loading
+    (Chromium) — not until the page stops moving, which carousels never do."""
     t = time.perf_counter()
     WINDOW.front()
     before = agent.screen_signature(agent.read_screen(app))
     WINDOW.goto(url)
-    agent.wait_for_change(app, before, timeout=15.0, min_items=5)
-    return (time.perf_counter() - t) * 1000
+    time.sleep(0.3)
+    while agent.page_loading(app) and time.perf_counter() - t < 30:
+        time.sleep(0.2)
+    loaded = (time.perf_counter() - t) * 1000
+    agent.wait_for_change(app, before, timeout=4.0, min_items=5)   # let the page settle, briefly
+    return loaded
 
 
 def norm(url: str) -> str:
@@ -407,6 +412,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     gem = ctx.planner
     if gem is not None:
         gem.grounding = False   # test data like "QA Tester" must not be looked up on the web
+    ctx.planner = None          # each test step is one UI action: Jev does it, nothing to plan
     url = resolve_target(target, gem)
     if not url:
         base_io.say(f"✗ Could not find the site '{target}'. Give its address, e.g. test example.com")
@@ -614,6 +620,64 @@ def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[st
     return done
 
 
+Q_OPEN, Q_CLOSE = "\"“'‘", "\"”'’"
+STEP_CLICK = re.compile(rf"^\s*(?:click|press|tap|select|open|toggle|expand|collapse|choose|check|uncheck)\b"
+                        rf"[^{Q_OPEN}]*[{Q_OPEN}](?P<label>.+)[{Q_CLOSE}]", re.I)
+STEP_TYPE = re.compile(rf"^\s*(?:type|enter|write|fill(?: in)?)\s+[{Q_OPEN}](?P<value>.*?)[{Q_CLOSE}]\s+"
+                       rf"(?:in|into)\s+(?:the\s+)?(?:[{Q_OPEN}](?P<qfield>.+)[{Q_CLOSE}]|(?P<field>.+?))"
+                       rf"(?:\s+(?:input\s+)?(?:field|box|input|area|textbox))?\s*$", re.I)
+
+
+def label_candidates(text: str) -> list[str]:
+    """'Kullanıcı Sözleşmesi'ni okudum' checkbox → the longest quoted span first, then the shortest
+    (a label may contain an apostrophe; a step may quote two things)."""
+    out = [text]
+    m = re.match(rf"(.+?)[{Q_CLOSE}]", text)
+    if m:
+        out.append(m.group(1))
+    return list(dict.fromkeys(t.strip() for t in out if t.strip()))
+
+
+def direct_step(step: str, ctx, app: str) -> list[str] | None:
+    """'click the 'İLERİ' button' / 'type 'x' into the Email field': done straight from the visible label,
+    without planning or interpreting the step. None if the step is not that simple or the label is not
+    clearly on the page (the agent loop then takes over)."""
+    m = STEP_TYPE.match(step)
+    if m:
+        field = m.group("qfield") or m.group("field")
+        for f in label_candidates(field):
+            try:
+                return fill_form([{"field": f, "value": m.group("value")}], ctx, app, None)
+            except RuntimeError:
+                continue
+        return None
+    m = STEP_CLICK.match(step)
+    if not m:
+        return None
+    items = [i for i in agent.read_screen(app) if i.get("page") and (i.get("pressable") or i["role"] in FIELD_ROLES)]
+    best = None
+    for label in label_candidates(m.group("label")):
+        def score(it, label=label):
+            a, b = " ".join(fold(label)), " ".join(fold(it["label"].split(" | ")[0]))
+            if not a or not b:
+                return 0
+            return 3 if a == b else 2 if b.startswith(a) or a.startswith(b) else 1 if a in b else 0
+        cand = max(items, key=lambda i: (score(i), -len(i["label"])), default=None)
+        if cand is not None and score(cand) >= 2:
+            best = cand
+            break
+    if best is None:
+        return None
+    before = agent.screen_signature(agent.read_screen(app))
+    agent.press(best, ctx)
+    after = agent.wait_for_change(app, before, timeout=2.5)
+    changed = agent.screen_signature(after) != before
+    if not changed and agent.mouse_click(best):   # the element ignored AXPress: a real click
+        after = agent.wait_for_change(app, before, timeout=2.0)
+        changed = agent.screen_signature(after) != before
+    return [f"clicked '{best['label'][:50]}'" + ("" if changed else " (but no change on screen)")]
+
+
 def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir: Path, number: int,
              account: dict | None = None) -> dict:
     t0 = time.time()
@@ -640,7 +704,8 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             WINDOW.front()   # the user may have switched windows: act only in the test window
         blocked_before = len(io.blocked)
         try:
-            r = agent.handle(client, step, ctx)
+            done = direct_step(step, ctx, app)   # simple steps by their visible label, no interpretation
+            r = {"ok": True, "steps": done} if done is not None else agent.handle(client, step, ctx)
         except Exception as e:
             r = {"ok": False, "steps": [f"error: {e}"]}
         shown = masked(step, account)

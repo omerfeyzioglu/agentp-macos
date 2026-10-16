@@ -496,6 +496,7 @@ def ax_label(el, role: str) -> str:
         if isinstance(v, str) and v.strip():
             v = v.strip().replace("\u200e", "").replace("\u2068", "").replace("\u2069", "")
             v = re.sub(r",?\s*Double tap[^|]*$", "", v)   # same hints inside descriptions
+            v = re.sub(r"[\ue000-\uf8ff]", "", v).strip()   # icon-font glyphs ("ÖNEMLİ BİLGİ ")
             if v and v not in parts:
                 parts.append(v)
     return " | ".join(parts)[:110]
