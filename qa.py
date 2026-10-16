@@ -778,7 +778,10 @@ def local_parse(cmd: str) -> dict:
     else:
         m = SPOKEN_DOMAIN.search(text)
         if m:
-            name = re.sub(r"\s+", "", m.group(1))   # "ford" (spoken names have no spaces in domains)
+            words = [w for w in re.split(r"[ .]+", m.group(1)) if w]
+            while len(words) > 1 and words[0].casefold() in FILLER | {"go", "open", "git", "aç", "to"}:
+                words.pop(0)   # "test ford com tr": "test" is the command, not part of the name
+            name = "".join(words)   # spoken names have no spaces in domains ("hepsi burada" → hepsiburada)
             site = ".".join(x for x in (name, m.group(2), m.group(3)) if x).lower()
             rest = text[:m.start()] + " " + text[m.end():]
     rest = re.sub(r"^['’]?\w{0,3}\b", "", rest.strip()) if rest.strip()[:1] in "'’" else rest   # "'nin"
@@ -901,7 +904,8 @@ def test_target(cmd: str) -> str | None:
 
 def main():
     ap = argparse.ArgumentParser(description="AgentP exploratory functional testing")
-    ap.add_argument("site", help="address or name of the site to test")
+    ap.add_argument("site", nargs="+", help="what to test, as in the panel: 'ford.com.tr', 'ford com tr kampanyalar', "
+                                             "'ford.com.tr > binek araçlar > kuga', 'https://site.com/page'")
     ap.add_argument("--pages", type=int, default=6, help="pages to explore (default 6)")
     ap.add_argument("--minutes", type=float, default=15, help="time budget (default 15)")
     ap.add_argument("--tests", type=int, default=3, help="tests per page (default 3)")
@@ -914,9 +918,10 @@ def main():
     agent.check_env()
     if not agent.AXIsProcessTrusted():
         sys.exit(agent.PERM_MSG)
+    request = " ".join(args.site)
     allow = not args.no_submit
     if allow and not args.yes:
-        a = input(f"AgentP will click through {args.site}, fill forms with made-up test data and submit them.\n"
+        a = input(f"AgentP will click through {request}, fill forms with made-up test data and submit them.\n"
                   "It never pays, buys, deletes, logs out or contacts anyone. Allow form submission? (Y/n) ")
         allow = a.strip().casefold() in ("", "y", "yes")
     account = None
@@ -924,8 +929,14 @@ def main():
         from getpass import getpass
         account = {"username": args.user, "password": args.password or getpass("Test account password: ")}
     from typesafe_sdk import TypeSafeClient
-    r = run_session(args.site, TypeSafeClient(), agent.CliIO(), args.pages, args.minutes, args.tests, allow,
-                    Path(args.out) if args.out else None, account)
+    req = parse_request("test " + request, None) or {}
+    if req.get("error") or not req.get("site"):
+        sys.exit(req.get("error") or f"Could not tell which site to test from '{request}'.")
+    single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
+    focus = req.get("focus") or (req["hops"][-1] if req.get("hops") else "")
+    r = run_session(req["site"], TypeSafeClient(), agent.CliIO(), 1 if single and args.pages == 6 else args.pages,
+                    args.minutes, args.tests, allow, Path(args.out) if args.out else None, account,
+                    focus=focus, page_hint=req.get("page_hint", ""))
     if r.get("report"):
         subprocess.run(["open", r["report"]["html"]], check=False)
     bad = [t for t in r.get("tests", []) if t["status"] in ("failed", "error")]
