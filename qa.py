@@ -153,6 +153,24 @@ class TestWindow:
         what = "name" if self.safari else "title"
         return osa_get(f'tell application "{self.app}" to get {what} of {self._tab()}')
 
+    def focused(self) -> bool:
+        """Is the test window the browser's focused window (the one the agent reads and clicks)?"""
+        a = agent.find_running(self.app)
+        if not a:
+            return False
+        win = agent.ax(agent.AXUIElementCreateApplication(a.processIdentifier()), "AXFocusedWindow")
+        wtitle = str(agent.ax(win, "AXTitle") or "") if win is not None else ""
+        mine = self.title()
+        return bool(mine) and mine[:30] in wtitle
+
+    def ensure_front(self):
+        for _ in range(3):
+            self.front()
+            time.sleep(0.25)
+            if self.focused():
+                return True
+        return False
+
 
 WINDOW: TestWindow | None = None   # the session's test window
 
@@ -177,6 +195,11 @@ def goto(app: str, url: str) -> float:
         time.sleep(0.2)
     loaded = (time.perf_counter() - t) * 1000
     agent.wait_for_change(app, before, timeout=4.0, min_items=5)   # let the page settle, briefly
+    for _ in range(2):   # consent banners often appear a moment after load
+        if dismiss_overlays(app):
+            agent.wait_for_change(app, "", timeout=1.5)
+        else:
+            break
     return loaded
 
 
@@ -258,6 +281,33 @@ def form_fields(items: list[dict]) -> list[dict]:
                 f["current"] = str(v)[:40]
         out.append(f)
     return out[:40]
+
+
+CONSENT_TEXT = re.compile(r"cookie|çerez|kvkk|gdpr|privacy|gizlilik|consent|onay", re.I)
+CONSENT_PREFER = [   # the most privacy-preserving choice first
+    re.compile(r"^(reject|decline|deny)( all)?$|^tümünü reddet$|^reddet$|only (necessary|essential)|sadece (gerekli|zorunlu)|"
+               r"necessary only|yalnızca zorunlu|zorunlu (çerezler|olanlar)", re.I),
+    re.compile(r"^(accept|agree|allow|ok|okay|got it|i agree|kabul( et)?|tümünü kabul et|tamam|anladım|onayla|"
+               r"accept all|allow all|accept cookies|çerezleri kabul et)( all)?[.!]?$", re.I),
+    re.compile(r"^(close|kapat|×|✕|x)$", re.I),
+]
+
+
+def dismiss_overlays(app: str) -> str | None:
+    """Close a cookie / consent banner if one is up (it hides the page from the accessibility tree).
+    Prefers 'reject / only necessary'. Returns what was pressed."""
+    items = agent.read_screen(app)
+    page = [i for i in items if i.get("page")]
+    if not any(CONSENT_TEXT.search(i["label"]) for i in page):
+        return None
+    buttons = [i for i in page if i.get("pressable") and i["role"] in ("AXButton", "AXLink")]
+    for pattern in CONSENT_PREFER:
+        for b in buttons:
+            if pattern.search(b["label"].split(" | ")[0].strip()):
+                agent.press(b, agent.Ctx(installed=[]))
+                time.sleep(0.8)
+                return b["label"][:40]
+    return None
 
 
 def snapshot(app: str) -> dict:
@@ -560,6 +610,18 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     return result
 
 
+def screen_note(app: str, fields: list[dict]) -> str:
+    """What the agent actually saw, for the report (so a failure can be understood without guessing)."""
+    items = agent.read_screen(app)
+    a = agent.find_running(app)
+    win = agent.ax(agent.AXUIElementCreateApplication(a.processIdentifier()), "AXFocusedWindow") if a else None
+    title = str(agent.ax(win, "AXTitle") or "?") if win is not None else "?"
+    page = [i["label"][:40] for i in items if i.get("page")][:12]
+    return (f"Focused window: '{title[:60]}'"
+            + ("" if WINDOW is None or WINDOW.focused() else " (not the test window)")
+            + f"; fields seen: {[i['label'][:30] for i in fields][:10]}; page shows: {page}")
+
+
 def best_field(name: str, fields: list[dict]) -> dict | None:
     """The form field whose label best matches the planned field name."""
     if not fields:
@@ -584,10 +646,18 @@ def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[st
     done = []
     for f in fills:
         name, value = f.get("field", ""), secret(str(f.get("value", "")), account)
-        fields = [i for i in agent.read_screen(app) if i.get("page") and i["role"] in FIELD_ROLES]
-        it = best_field(name, fields)
+        it, fields = None, []
+        for attempt in range(3):   # the form may still be rendering, a banner may cover it, focus may be elsewhere
+            fields = [i for i in agent.read_screen(app) if i.get("page") and i["role"] in FIELD_ROLES]
+            it = best_field(name, fields)
+            if it is not None:
+                break
+            if WINDOW is not None:
+                WINDOW.ensure_front()
+            dismiss_overlays(app)
+            time.sleep(1.0)
         if it is None:
-            raise RuntimeError(f"no field like '{name}' on the page")
+            raise RuntimeError(f"no field like '{name}' on the page. " + screen_note(app, fields))
         kind = field_kind(it)
         if kind in ("checkbox", "radio"):
             want = value.casefold() not in ("uncheck", "unchecked", "false", "no", "0", "off")
@@ -692,7 +762,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
                    for f in test.get("fill") or []]
     if test.get("fill"):
         if WINDOW is not None:
-            WINDOW.front()
+            WINDOW.ensure_front()
         try:
             rec["agent_steps"] += [f"fill → {s}" for s in fill_form(test["fill"], ctx, app, account)]
         except Exception as e:
@@ -701,7 +771,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
     for step in ([] if rec["status"] else test["steps"]):
         step = secret(step, account)
         if WINDOW is not None:
-            WINDOW.front()   # the user may have switched windows: act only in the test window
+            WINDOW.ensure_front()   # the user may have switched windows: act only in the test window
         blocked_before = len(io.blocked)
         try:
             done = direct_step(step, ctx, app)   # simple steps by their visible label, no interpretation
@@ -721,7 +791,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             break
     if not rec["status"]:
         if WINDOW is not None:
-            WINDOW.front()
+            WINDOW.ensure_front()
         rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, test["expect"])
     if rec["status"] != "passed":
         rec["screenshot"] = screenshot(app, out_dir / f"test{number}.png")
