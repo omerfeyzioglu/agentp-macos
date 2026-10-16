@@ -105,6 +105,8 @@ For each page, starting from the address and staying on that site:
 4. **AgentP runs the steps** with the normal agent loop, and **Jev checks the expected result** on screen (Gemini decides only when Jev is unsure).
 5. **Go deeper** into the most important unvisited pages.
 
+Your browser: the session opens its **own browser window** and works only there; your other windows and tabs are never navigated, read or closed, and closing tabs / windows or quitting apps is not allowed during a test. Press **Esc** in the panel (or **P → Stop Current Task**) to stop; the report is still written for what was tested.
+
 Safety: made-up test data only; never pays, buys, deletes, logs out or contacts anyone; never leaves the site. Form submission is asked once at the start (`--no-submit` tests validation only).
 
 The report goes to `~/.agentp/qa/<time>-<site>/`: `report.html` (issues by severity, every test with its steps, expected result, what the agent did and a screenshot of failures), `results.json` and `junit.xml` for CI. The exit code is non-zero when a test fails or a high-severity issue is found.

@@ -111,25 +111,66 @@ def osa_get(script: str) -> str:
         return ""
 
 
+class TestWindow:
+    """A browser window opened for this test session. Everything happens in it: the user's own
+    windows and tabs are never navigated, closed or read."""
+
+    def __init__(self, app: str, url: str):
+        self.app, self.safari = app, app == "Safari"
+        if not agent.find_running(app):
+            subprocess.run(["open", "-a", app], check=False)
+            time.sleep(2.0)
+        u = url.replace('"', '%22')
+        if self.safari:
+            wid = osa_get(f'tell application "Safari"\nmake new document with properties {{URL:"{u}"}}\n'
+                          'return id of front window\nend tell')
+        else:
+            wid = osa_get(f'tell application "{app}"\nset w to make new window\nset URL of active tab of w to "{u}"\n'
+                          'return id of w\nend tell')
+        if not wid.isdigit():
+            raise RuntimeError(f"could not open a test window in {app} (allow AgentP to control {app} "
+                               "in System Settings → Privacy & Security → Automation)")
+        self.id = wid
+
+    def _ref(self) -> str:
+        return f"(first window whose id is {self.id})"
+
+    def _tab(self) -> str:
+        return f"{'current' if self.safari else 'active'} tab of {self._ref()}"
+
+    def front(self):
+        osa_get(f'tell application "{self.app}" to set index of {self._ref()} to 1')
+        agent.activate(self.app, agent.Ctx(installed=[]))
+
+    def goto(self, url: str):
+        u = url.replace('"', '%22')
+        osa_get(f'tell application "{self.app}" to set URL of {self._tab()} to "{u}"')
+
+    def url(self) -> str:
+        return osa_get(f'tell application "{self.app}" to get URL of {self._tab()}')
+
+    def title(self) -> str:
+        what = "name" if self.safari else "title"
+        return osa_get(f'tell application "{self.app}" to get {what} of {self._tab()}')
+
+
+WINDOW: TestWindow | None = None   # the session's test window
+
+
 def current_url(app: str) -> str:
+    if WINDOW is not None:
+        return WINDOW.url()
     if app == "Safari":
         return osa_get('tell application "Safari" to get URL of front document')
     return osa_get(f'tell application "{app}" to get URL of active tab of front window')
 
 
 def goto(app: str, url: str) -> float:
-    """Load url in the current tab (no tab pile-up). Returns the load time in ms."""
+    """Load url in the test window. Returns the load time in ms."""
     t = time.perf_counter()
-    before = agent.screen_signature(agent.read_screen(app)) if agent.find_running(app) else ""
-    if not agent.find_running(app):
-        subprocess.run(["open", "-a", app, url], check=False)
-    elif app == "Safari":
-        osa_get(f'tell application "Safari" to set URL of front document to "{url}"')
-    else:
-        done = osa_get(f'tell application "{app}" to set URL of active tab of front window to "{url}"\nreturn "ok"')
-        if not done:
-            subprocess.run(["open", "-a", app, url], check=False)
-    agent.activate(app, agent.Ctx(installed=[]))
+    WINDOW.front()
+    before = agent.screen_signature(agent.read_screen(app))
+    WINDOW.goto(url)
     agent.wait_for_change(app, before, timeout=15.0, min_items=5)
     return (time.perf_counter() - t) * 1000
 
@@ -226,8 +267,7 @@ def snapshot(app: str) -> dict:
             if key not in seen:
                 seen.add(key)
                 links.append({"label": it["label"][:80], "url": u})
-    title = osa_get(f'tell application "{app}" to get title of active tab of front window') if app != "Safari" \
-        else osa_get('tell application "Safari" to get name of front document')
+    title = WINDOW.title() if WINDOW is not None else ""
     return {
         "url": current_url(app), "title": title, "items": items,
         "headings": [i["label"][:100] for i in page if i["role"] == "AXHeading"][:30],
@@ -358,7 +398,7 @@ def resolve_target(target: str, gem) -> str | None:
 
 def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 15, tests_per_page: int = 3,
                 allow_submit: bool = True, out_dir: Path | None = None, account: dict | None = None,
-                focus: str = "", page_hint: str = "") -> dict:
+                focus: str = "", page_hint: str = "", stop=None) -> dict:
     """account: {"username": ..., "password": ...} of a TEST account on the site under test. Gemini only
     sees the placeholders {{username}} / {{password}}; values are filled in locally and masked in reports."""
     account = account or test_account()
@@ -375,11 +415,22 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
         base_io.say(f"✗ {urllib.parse.urlsplit(url).hostname} does not exist. Check the address "
                     f"(dictation may have misheard it).")
         return {}
+    global WINDOW
     app = browser()
+    try:
+        WINDOW = TestWindow(app, url)   # its own window: the user's tabs are never touched
+    except RuntimeError as e:
+        base_io.say(f"✗ {e}")
+        return {}
     scope = domain(url)
     in_scope = lambda: domain(current_url(app) or url).endswith(scope)  # noqa: E731
     io = QAIO(base_io, allow_submit, in_scope)
     ctx.io, ctx.record, ctx.active_app = io, False, app
+    stopped = stop or (lambda: False)
+    ctx.stop = stopped
+    ctx.url_opener = lambda u: WINDOW.goto(u)
+    ctx.blocked = frozenset({"quit_app", "close_tab", "close_window", "new_window", "new_tab", "reopen_tab",
+                             "minimize", "fullscreen"})
     out_dir = out_dir or QA_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{scope}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -404,7 +455,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     checked_links: dict[str, object] = {}
     deadline = t_start + minutes * 60
 
-    while queue and len(result["pages"]) < pages and time.time() < deadline:
+    while queue and len(result["pages"]) < pages and time.time() < deadline and not stopped():
         page_url = queue.pop(0)
         if norm(page_url) in visited:
             continue
@@ -446,7 +497,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
                 io.progress(f"  (could not plan tests here: {str(e)[:80]})")
         page["purpose"] = ideas.get("page_purpose", "")
         for n, test in enumerate(ideas["tests"]):
-            if time.time() > deadline:
+            if time.time() > deadline or stopped():
                 break
             if n > 0 or norm(current_url(app) or "") != norm(landed):
                 goto(app, landed)   # every test starts from the page itself
@@ -483,9 +534,13 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
             issue("medium" if isinstance(st, int) and st == 404 else "low", page_url, f"Broken link ({st}): {label}", key)
     link_pool.shutdown(wait=False)
 
+    result["stopped"] = stopped()
+    if result["stopped"]:
+        io.progress("  Stopped. Writing the report for what was tested so far.")
     result["duration_s"] = round(time.time() - t_start)
     result["links_checked"] = len(checked_links)
     paths = write_reports(result, out_dir)
+    WINDOW = None   # the test window stays open for the user to look at; the session is over
     passed = sum(t["status"] == "passed" for t in result["tests"])
     io.progress(f"  Done in {result['duration_s'] // 60} min {result['duration_s'] % 60} s: {len(result['pages'])} pages, "
                 f"{passed}/{len(result['tests'])} tests passed, {len(result['issues'])} issues")
@@ -567,6 +622,8 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
     rec["fill"] = [{"field": f.get("field"), "value": masked(secret(str(f.get("value", "")), account), account)}
                    for f in test.get("fill") or []]
     if test.get("fill"):
+        if WINDOW is not None:
+            WINDOW.front()
         try:
             rec["agent_steps"] += [f"fill → {s}" for s in fill_form(test["fill"], ctx, app, account)]
         except Exception as e:
@@ -574,6 +631,8 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             rec["status"], rec["note"] = "error", f"Could not fill the form: {e}"
     for step in ([] if rec["status"] else test["steps"]):
         step = secret(step, account)
+        if WINDOW is not None:
+            WINDOW.front()   # the user may have switched windows: act only in the test window
         blocked_before = len(io.blocked)
         try:
             r = agent.handle(client, step, ctx)
@@ -591,6 +650,8 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             rec["note"] = masked(f"Step could not be completed: '{step}' — {why}", account)
             break
     if not rec["status"]:
+        if WINDOW is not None:
+            WINDOW.front()
         rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, test["expect"])
     if rec["status"] != "passed":
         rec["screenshot"] = screenshot(app, out_dir / f"test{number}.png")
@@ -810,7 +871,7 @@ def pick_link(client, app: str, hint: str, snap: dict) -> str | None:
     return links[int(ch.choice[1:])]["url"] if ch.choice != "none" and ch.confidence >= 0.4 else None
 
 
-def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None) -> dict:
+def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None, stop=None) -> dict:
     """Panel / terminal entry: understand the request, then test the site, a page of it, or this page."""
     req = parse_request(cmd, gem)
     if req is None:
@@ -824,7 +885,7 @@ def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None) -> dict
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
     return run_session(req["site"], client, base_io, pages=1 if single else 6,
                        tests_per_page=5 if focused else 3, allow_submit=allow_submit,
-                       focus=req.get("focus", ""), page_hint=req.get("page_hint", ""))
+                       focus=req.get("focus", ""), page_hint=req.get("page_hint", ""), stop=stop)
 
 
 def test_target(cmd: str) -> str | None:

@@ -229,6 +229,9 @@ class Ctx:
     record: bool = True
     dry_run: bool = False
     planner: object = None           # planner.Gemini or None (Jev-only)
+    url_opener: object = None        # open_url goes here instead of a new tab (qa.py: its own test window)
+    blocked: frozenset = frozenset() # actions / shortcuts not allowed (qa.py: never close or quit anything)
+    stop: object = None              # callable: True when the user asked to stop (Esc / menu)
     last_answer: str | None = None   # result of the last summarize step ({answer} in typed text)
 
 
@@ -1238,6 +1241,8 @@ def summary_texts(ctx: Ctx, items: list[dict], min_page_texts: int = 20) -> list
 
 def execute(d: dict, cmd: str, ctx: Ctx) -> str:
     act = d["action"]
+    if act in ctx.blocked or (act == "shortcut" and d.get("shortcut") in ctx.blocked):
+        raise RuntimeError(f"'{d.get('shortcut') or act}' is not allowed here")
     if act in ("click", "type", "enter", "escape", "scroll", "back", "shortcut") and ctx.active_app:
         activate(ctx.active_app, ctx)
 
@@ -1266,6 +1271,8 @@ def execute(d: dict, cmd: str, ctx: Ctx) -> str:
             url = "https://duckduckgo.com/?q=" + urllib.parse.quote("\\" + site)
         if ctx.dry_run:
             ctx.io.say(f"    (dry-run) open {url}")
+        elif ctx.url_opener is not None:
+            ctx.url_opener(url)   # e.g. the test window, never a new tab or someone else's tab
         else:
             subprocess.run(["open", url], check=False)
             ctx.active_app = default_browser()
@@ -1470,6 +1477,9 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
         return {"ok": False, "steps": [], "total_ms": (time.perf_counter() - t0) * 1000}
 
     for n in range(1, MAX_STEPS + 1):
+        if ctx.stop is not None and ctx.stop():
+            say("  Stopped.")
+            break
         upcoming = " ".join(f"{s['do']} {s.get('target', '')}" for s in (plan or [])[len(done_steps):len(done_steps) + 2])
         items = trim(items, f"{cmd} {upcoming}")
         screen = screen_info(ctx)

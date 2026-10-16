@@ -241,6 +241,7 @@ class UI(NSObject):
     def init(self):
         self = objc.super(UI, self).init()
         self.busy = False
+        self.stop_requested = False
         self.answer_cb = None
         self.entries, self.collecting = [], None   # activity log model (rows + collapsible plans)
         self.client = TypeSafeClient() if not config.missing_required() else None
@@ -550,6 +551,8 @@ class UI(NSObject):
             self.show_keys()
             return
         self._set_busy(True)
+        self.stop_requested = False
+        self.ctx.stop = lambda: self.stop_requested   # normal commands stop between steps too
         threading.Thread(target=self._run, args=(cmd,), daemon=True).start()
 
     @objc.python_method
@@ -558,7 +561,8 @@ class UI(NSObject):
             if qa.TEST_REQUEST.search(cmd):   # "test example.com", "bu sayfayı test et", "test the login page of x.com"
                 allow = self.ctx.io.confirm("Fill forms with made-up test data and submit them? "
                                             "(never pays, deletes or contacts anyone)", default_yes=True)
-                r = qa.run_request(cmd, self.client, self.ctx.io, allow, self.ctx.planner)
+                r = qa.run_request(cmd, self.client, self.ctx.io, allow, self.ctx.planner,
+                                   stop=lambda: self.stop_requested)
                 if r.get("report"):
                     subprocess.run(["open", r["report"]["html"]], check=False)
                 return
@@ -590,7 +594,8 @@ class UI(NSObject):
         self.status.button().setFont_(NSFont.systemFontOfSize_weight_(13, 0.6))
         menu = NSMenu.alloc().init()
         for title, sel in (("Show AgentP    ⌥Space", "menuShow:"), ("Mark Last Request as Wrong", "menuWrong:"),
-                           ("Clear Context", "menuReset:"), ("API Keys…", "menuKeys:"), (None, None),
+                           ("Stop Current Task    Esc", "menuStop:"), ("Clear Context", "menuReset:"),
+                           ("API Keys…", "menuKeys:"), (None, None),
                            ("Quit", "menuQuit:")):
             if title is None:
                 menu.addItem_(NSMenuItem.separatorItem())
@@ -605,6 +610,15 @@ class UI(NSObject):
 
     def menuWrong_(self, _):
         agent.mark_wrong(self.ctx)
+
+    def menuStop_(self, _):
+        self.request_stop()
+
+    @objc.python_method
+    def request_stop(self):
+        if self.busy and not self.stop_requested:
+            self.stop_requested = True
+            self.append("  (stopping after the current step…)")
 
     def menuReset_(self, _):
         self.entries, self.collecting = [], None
@@ -711,6 +725,9 @@ class UI(NSObject):
         def local_handler(e):
             if is_hotkey(e):
                 self.toggle()
+                return None
+            if e.keyCode() == KEY_ESC and self.answer_cb is None and self.busy:
+                self.request_stop()   # Esc while working: stop after the current step
                 return None
             if e.keyCode() == KEY_ESC and self.answer_cb is None and not self.busy:
                 self.hide()
