@@ -15,6 +15,7 @@ Usage:
 """
 import os
 import re
+import subprocess
 import sys
 import threading
 
@@ -67,6 +68,7 @@ from PyObjCTools import AppHelper
 from typesafe_sdk import TypeSafeClient
 
 import agent
+import qa
 import config
 
 KEY_SPACE, KEY_ESC = 49, 53
@@ -553,6 +555,14 @@ class UI(NSObject):
     @objc.python_method
     def _run(self, cmd: str):
         try:
+            target = qa.test_target(cmd)
+            if target:   # "test example.com": exploratory functional testing
+                allow = self.ctx.io.confirm(f"Fill forms on {target} with made-up test data and submit them? "
+                                            "(never pays, deletes or contacts anyone)", default_yes=True)
+                r = qa.run_session(target, self.client, self.ctx.io, allow_submit=allow)
+                if r.get("report"):
+                    subprocess.run(["open", r["report"]["html"]], check=False)
+                return
             agent.handle(self.client, cmd, self.ctx)
         except Exception as e:
             self.ctx.io.say(f"✗ {e}")

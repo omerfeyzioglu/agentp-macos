@@ -2,6 +2,7 @@
 # AgentP launcher: finds Python 3.10+, sets up .venv on first run, then opens the panel.
 #   ./run.sh              open the panel (⌥Space)
 #   ./run.sh --terminal   use the terminal interface instead
+#   ./run.sh --test SITE  exploratory functional test of a website (report in ~/.agentp/qa)
 # Extra arguments are passed through to ui.py / agent.py.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -56,6 +57,10 @@ if ! .venv/bin/python -c 'from ApplicationServices import AXIsProcessTrusted; im
 fi
 
 # 3. run (the panel asks for your API keys on first launch)
+if [ "${1:-}" = "--test" ]; then
+  shift
+  exec .venv/bin/python qa.py "$@"
+fi
 if [ "${1:-}" = "--terminal" ]; then
   shift
   exec .venv/bin/python agent.py "$@"

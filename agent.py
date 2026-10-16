@@ -513,13 +513,21 @@ def ax_rect(el) -> tuple[float, float, float, float] | None:
         return None
 
 
-def region_of(rect, win) -> str | None:
-    """Where the element sits in the window. None if outside the window (not visible)."""
+def region_of(rect, win, in_page: bool = False) -> str | None:
+    """Where the element sits in the window. Outside the window: None, except page content that is
+    only scrolled away, which is 'above' / 'below' (reachable with AXScrollToVisible)."""
     if rect is None or win is None:
         return "?"
     x, y, w, h = rect
     wx, wy, ww, wh = win
-    if w <= 0 or h <= 0 or x + w < wx or x > wx + ww or y + h < wy or y > wy + wh:
+    if w <= 0 or h <= 0:
+        return None
+    if in_page and x + w >= wx and x <= wx + ww:
+        if y > wy + wh:
+            return "below"
+        if y + h < wy:
+            return "above"
+    if x + w < wx or x > wx + ww or y + h < wy or y > wy + wh:
         return None
     cx, cy = (x + w / 2 - wx) / ww, (y + h / 2 - wy) / wh
     if cy < 0.12:
@@ -554,16 +562,24 @@ def read_screen(app_name: str) -> list[dict]:
         if role in ROLES and lb and ax(el, "AXEnabled") is not False:
             acts = ax_actions(el)
             if role in TEXT_ROLES or role in READ_ROLES or "AXPress" in acts:
-                reg = region_of(ax_rect(el), win_rect)
-                if reg is not None:   # outside the window (scrolled away, hidden) → not sent to Jev
+                reg = region_of(ax_rect(el), win_rect, in_page)
+                if reg is not None:   # hidden / outside the window → not sent to Jev
                     items.append({"el": el, "role": role, "label": lb, "region": reg,
-                                  "pressable": "AXPress" in acts, "page": in_page, "order": len(items)})
+                                  "pressable": "AXPress" in acts, "page": in_page, "order": len(items),
+                                  "offscreen": reg in ("above", "below")})
         lines.append("  " * min(d, 30) + f"{role} [{lb}]")
         for k in ax(el, "AXChildren") or []:
             walk(k, d + 1, in_page or role == "AXWebArea")
 
     if win is not None:
         walk(win)
+    for child in ax(root, "AXChildren") or []:   # open popups: <select> lists, context menus
+        if ax(child, "AXRole") == "AXMenu":
+            for it in ax(child, "AXChildren") or []:
+                t = ax_label(it, "AXMenuItem")
+                if t and ax(it, "AXEnabled") is not False:
+                    items.append({"el": it, "role": "AXMenuItem", "label": t, "region": "open menu",
+                                  "pressable": True, "popup": True, "order": len(items)})
     bar = ax(root, "AXMenuBar")
     if bar is not None:
         for top in list(ax(bar, "AXChildren") or [])[1:]:   # skip the Apple menu
@@ -598,6 +614,14 @@ def trim(items: list[dict], cmd: str) -> list[dict]:
     newest videos) plus the ones most similar to the command. Plain texts at most MAX_READS."""
     if len(items) <= MAX_ELEMENTS:
         return items
+    popups = [i for i in items if i.get("popup")]
+    if popups:   # an open menu is what the next step is about
+        return popups[:60] + trim([i for i in items if not i.get("popup")], cmd)[:MAX_ELEMENTS - min(len(popups), 60)]
+    hidden = [i for i in items if i.get("offscreen")]
+    if hidden:   # visible things first; scrolled-away ones fill what is left, most relevant first
+        shown = trim([i for i in items if not i.get("offscreen")], cmd)
+        room = MAX_ELEMENTS - len(shown)
+        return shown + (fuzzy_rank(cmd, hidden, key=lambda x: x["label"], k=room) if room > 0 else [])
     texts = [i for i in items if i["role"] in TEXT_ROLES]
     reads = [i for i in items if i["role"] in READ_ROLES and not i.get("pressable")]
     rest = [i for i in items if i not in texts and i not in reads]
@@ -1009,10 +1033,18 @@ def mouse_click(it: dict) -> bool:
     return True
 
 
+def reveal(it: dict):
+    """Scroll a scrolled-away element into view (deep pages, long forms) before using it."""
+    if it.get("offscreen") and it.get("el") is not None:
+        AXUIElementPerformAction(it["el"], "AXScrollToVisible")
+        time.sleep(0.35)
+
+
 def press(it: dict, ctx: Ctx):
     if ctx.dry_run:
         ctx.io.say(f"    (dry-run) press: {it['label']}")
         return
+    reveal(it)
     if it["role"] in TEXT_ROLES:
         AXUIElementSetAttributeValue(it["el"], "AXFocused", True)
         AXUIElementPerformAction(it["el"], "AXPress")
@@ -1872,6 +1904,15 @@ def main():
         if special_command(cmd, ctx):
             continue
         try:
+            import qa
+            target = qa.test_target(cmd)
+            if target:   # "test example.com": exploratory functional testing
+                allow = ctx.io.confirm(f"Fill forms on {target} with made-up test data and submit them? "
+                                       "(never pays, deletes or contacts anyone)", default_yes=True)
+                r = qa.run_session(target, client, ctx.io, allow_submit=allow)
+                if r.get("report"):
+                    subprocess.run(["open", r["report"]["html"]], check=False)
+                continue
             handle(client, cmd, ctx)
         except Exception as e:
             print(f"  Error: {e}")

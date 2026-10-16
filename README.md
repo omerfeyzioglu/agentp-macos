@@ -75,6 +75,27 @@ flowchart LR
 | `answer` | Answer a general question in words, without using the computer |
 | `system` | Volume, mute, dark mode, screen lock |
 
+## Functional testing
+
+Give AgentP a site and it tests it the way a QA engineer would, with no script to write:
+
+```bash
+./run.sh --test example.com                       # or in the panel: "test example.com"
+./run.sh --test https://shop.example.com --pages 8 --minutes 20 --no-submit
+```
+
+For each page, starting from the address and staying on that site:
+
+1. **Read the page:** headings, links, buttons, fields and open menus, including content below the fold.
+2. **Automatic checks:** HTTP errors, error pages ("Something went wrong", 404/500), slow loads, broken same-site links, controls that do nothing when used.
+3. **Gemini proposes tests** for the page's core features: search, filters, sorting, forms with valid and invalid input, navigation, tabs. Each test has concrete steps and one observable expected result.
+4. **AgentP runs the steps** with the normal agent loop, and **Jev checks the expected result** on screen (Gemini decides only when Jev is unsure).
+5. **Go deeper** into the most important unvisited pages.
+
+Safety: made-up test data only; never pays, buys, deletes, logs out or contacts anyone; never leaves the site. Form submission is asked once at the start (`--no-submit` tests validation only).
+
+The report goes to `~/.agentp/qa/<time>-<site>/`: `report.html` (issues by severity, every test with its steps, expected result, what the agent did and a screenshot of failures), `results.json` and `junit.xml` for CI. The exit code is non-zero when a test fails or a high-severity issue is found.
+
 ## Benchmark
 
 Per-step decision quality on **85 steps recorded during real use** (WhatsApp, Chrome, Gmail, Google Cloud, Medium, VS Code, Notes…). Each recorded screen is replayed and the model makes the same choice the agent faced live; no app is touched. Ground truth is the steps of requests that finished successfully plus the user's own corrections.
@@ -136,6 +157,7 @@ Advanced settings (not needed to get started): `GEMINI_MODEL` (planning, default
 | `what is the latest email` | Finds the answer on screen and reads it aloud |
 | `how tall is mount everest`, `usd to eur rate` | Answered in the panel with sources; current facts come from Google Search |
 | `close this tab`, `go back`, `scroll down`, `close chrome` | Shortcuts, navigation, quitting apps |
+| `test example.com` | Explores the site, runs functional tests, opens a QA report |
 
 In-session commands: `new` clears context, `!wrong` marks the last request as wrong (it is removed from memory and excluded from evaluation), `q` quits. The menu bar **P** icon offers the same.
 
@@ -161,6 +183,7 @@ ui.py                   ⌥Space panel, dictation, confirmations, menu bar icon
 planner.py              Gemini: planning, writing, answers, name lookups, eval baseline
 memory.py               learned picks, successful paths, who names refer to
 config.py               your API keys, stored on your Mac only
+qa.py                   exploratory functional testing of websites, QA reports
 eval.py                 developers: replay recorded steps, measure accuracy, latency and tokens
 run.sh, AgentP.command  one-command setup and launch
 ```

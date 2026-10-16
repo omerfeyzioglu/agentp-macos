@@ -249,6 +249,64 @@ class Gemini:
                 sources.append((web.title or web.uri, web.uri))
         return text.strip(), sources[:4], search_suggestions(meta)
 
+    # ------------------------------------------------ exploratory testing (qa.py)
+    def test_ideas(self, site: str, page: dict, tested: list[str], visited: list[str],
+                   max_tests: int, allow_submit: bool) -> dict:
+        """Act as a QA engineer on one page: what does it do, which functional tests are worth
+        running here (with concrete steps and the expected result), and which pages to explore next."""
+        system = f"""You are a senior QA engineer doing exploratory functional testing of {site}.
+A computer agent will carry out your test steps in a real browser, one plain command at a time, and a
+checker will verify your expected result by looking at the screen afterwards.
+
+Given the current page (title, URL, headings, links, buttons, fields), return:
+- page_purpose: one short line.
+- tests: at most {max_tests} functional tests that matter most on THIS page and were not already done
+  (see already_tested). Cover the page's core features: search, filters, sorting, forms (one valid case
+  and one invalid case such as empty required fields or a malformed email), navigation menus, tabs,
+  accordions, pagination, add-to-cart / like / follow style buttons, login error handling.
+  Each test: title; kind (navigation | form | search | interaction | content); steps — 1 to 5 short
+  commands that refer to elements by their visible labels (e.g. "type 'qa.tester@example.com' into the
+  Email field", "click the 'Subscribe' button"); expect — ONE observable outcome the checker can see on
+  screen (e.g. "an error message about the email address is shown", "the results list shows items
+  related to 'shoes'", "the Pricing page is open").
+- next_pages: up to 3 links (exact labels from the list) leading to important unvisited pages, most
+  important first.
+
+Rules: stay on {site}. Use made-up test data only (names like "QA Tester", emails at example.com,
+phone 5550000000). Never pay, buy, place orders, delete, unsubscribe, log out, change account settings,
+post publicly, or contact real people. {"Submitting forms with test data is allowed." if allow_submit
+else "Do not submit forms: test validation by leaving fields empty and observe inline messages only."}
+Prefer tests whose outcome is visible without logging in."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "page_purpose": {"type": "string"},
+                "tests": {"type": "array", "items": {"type": "object", "properties": {
+                    "title": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["navigation", "form", "search", "interaction", "content"]},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                    "expect": {"type": "string"}},
+                    "required": ["title", "kind", "steps", "expect"]}},
+                "next_pages": {"type": "array", "items": {"type": "object", "properties": {
+                    "label": {"type": "string"}, "why": {"type": "string"}}, "required": ["label"]}},
+            },
+            "required": ["page_purpose", "tests", "next_pages"],
+        }
+        prompt = json.dumps({"page": page, "already_tested": tested[-40:], "visited_pages": visited[-30:]},
+                            ensure_ascii=False)
+        out = self._json(system, prompt, schema)
+        out["tests"] = [t for t in out.get("tests", []) if t.get("steps") and t.get("expect")][:max_tests]
+        return out
+
+    def judge(self, expectation: str, screen: dict) -> tuple[bool, str]:
+        """Second opinion when Jev is unsure whether an expected result is on screen."""
+        system = ("You check one expected result of a functional test against what is on the screen. "
+                  "Answer with JSON: {\"passed\": true|false, \"reason\": \"one short sentence\"}.")
+        schema = {"type": "object", "properties": {"passed": {"type": "boolean"}, "reason": {"type": "string"}},
+                  "required": ["passed", "reason"]}
+        out = self._json(system, json.dumps({"expected": expectation, "screen": screen}, ensure_ascii=False), schema)
+        return bool(out.get("passed")), out.get("reason", "")
+
     def summarize(self, cmd: str, where: str, texts: list[str]) -> str:
         system = ("Summarize what the screen text says about the topic of the user's request, or answer "
                   "the question in it, using only that text. Ignore the parts of the request about where to "
