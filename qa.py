@@ -323,12 +323,28 @@ def masked(text: str, account: dict | None) -> str:
     return text
 
 
+def reachable(url: str) -> bool:
+    """Does the site's address exist (DNS)? Checked once, so a misheard name fails fast and clearly."""
+    import socket
+    host = urllib.parse.urlsplit(url).hostname or ""
+    for h in (host, "www." + host if not host.startswith("www.") else host[4:]):
+        try:
+            socket.getaddrinfo(h, 443)
+            return True
+        except OSError:
+            continue
+    return False
+
+
 def resolve_target(target: str, gem) -> str | None:
     target = target.strip().strip("'\"")
     if re.match(r"^https?://", target):
         return target
     if "." in target and " " not in target:
         return "https://" + target
+    loc = local_parse(target)
+    if loc["site"]:
+        return "https://" + loc["site"]
     if gem is not None:   # a name ("hepsiburada", "the sakarya university site") → official website
         try:
             for f in gem.lookup(f"official website of {target}", []):
@@ -355,6 +371,10 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     if not url:
         base_io.say(f"✗ Could not find the site '{target}'. Give its address, e.g. test example.com")
         return {}
+    if not reachable(url):
+        base_io.say(f"✗ {urllib.parse.urlsplit(url).hostname} does not exist. Check the address "
+                    f"(dictation may have misheard it).")
+        return {}
     app = browser()
     scope = domain(url)
     in_scope = lambda: domain(current_url(app) or url).endswith(scope)  # noqa: E731
@@ -369,13 +389,15 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
         {"severity": sev, "page": page, "what": what, "detail": detail, "screenshot": shot})
     what = f"{focus} on {scope}" if focus else (f"the {page_hint} page of {scope}" if page_hint else scope)
     io.progress(f"› Testing {what} in {app}" + (f" (up to {pages} pages, {minutes:.0f} min)" if pages > 1 else ""))
-    if page_hint:   # "the login page of github.com": find it from the start page
+    for hop in [h for h in re.split(r"\s*>\s*", page_hint) if h] if page_hint else []:
+        # "ford com tr > binek araçlar > kuga": click through, one named page at a time
         goto(app, url)
-        found = pick_link(client, app, f"{page_hint} ({focus})" if focus else page_hint, snapshot(app))
-        if found:
-            url = found
-        else:
-            io.progress(f"  (no link to a '{page_hint}' page on the start page; testing the start page)")
+        found = pick_link(client, app, hop, snapshot(app))
+        if not found:
+            io.progress(f"  (no link to '{hop}' on {current_url(app) or url}; testing from here)")
+            break
+        io.progress(f"  → {hop}: {found}")
+        url = found
 
     queue, visited, tested = [url], [], []
     link_pool = ThreadPoolExecutor(8)
@@ -673,16 +695,56 @@ a{{color:inherit}}
 
 
 # ---------------------------------------------------------------- entry points
+TLD = r"(com|net|org|io|ai|dev|app|co|edu|gov|gen|info|biz|tv|me|bel|k12)"
+CC = r"(tr|uk|de|us|fr|nl|eu|az|it|es|ru|ch|at|be|ca|au)"
+SPOKEN_DOMAIN = re.compile(rf"\b([a-z0-9][a-z0-9-]*(?:[ .][a-z0-9][a-z0-9-]*)??)[ .]+{TLD}(?:[ .]+{CC})?\b", re.I)
+FILLER = set("""test tests testi testini testleri testlerini testlerin et eder edin edebilir misin mısın yap yapar
+yapın yapabilir fonksiyon fonksiyonel fonksiyonları fonksiyonlarını functional function functions feature features
+özellik özellikleri özelliklerini the of on at in for and its please lütfen site sitesi sitesinin sitesinde
+website web page sayfa sayfası sayfasını sayfasının sayfayı nin nın nun nün in ın un ün de da için ve qa check
+kontrol tüm bütün whole all everything bu şu buradaki burada here this current these şuradaki""".split())
+PATH_SEP = re.compile(r"\s*(?:>|→|->|»| sonra | then )\s*", re.I)
+
+
+def local_parse(cmd: str) -> dict:
+    """No model: 'ford com tr kampanyalar sayfasını test et' → ford.com.tr + page 'kampanyalar'.
+    'ford com tr > binek araçlar > kuga' → a path of pages to click through."""
+    text = re.sub(r"\b(nokta|dot)\b", ".", cmd, flags=re.I)
+    m = URL_IN.search(text)
+    site, rest = None, text
+    if m and "." in m.group(0):
+        site, rest = m.group(0), text[:m.start()] + " " + text[m.end():]
+    else:
+        m = SPOKEN_DOMAIN.search(text)
+        if m:
+            name = re.sub(r"\s+", "", m.group(1))   # "ford" (spoken names have no spaces in domains)
+            site = ".".join(x for x in (name, m.group(2), m.group(3)) if x).lower()
+            rest = text[:m.start()] + " " + text[m.end():]
+    rest = re.sub(r"^['’]?\w{0,3}\b", "", rest.strip()) if rest.strip()[:1] in "'’" else rest   # "'nin"
+    hops = []
+    for part in PATH_SEP.split(rest):
+        words = [w for w in re.findall(r"[\w/-]+", part) if w.casefold() not in FILLER]
+        if words:
+            hops.append(" ".join(words))
+    return {"site": site, "hops": hops}
+
+
 def parse_request(cmd: str, gem) -> dict | None:
     """A test request in the user's words → {site, this_page, page_hint, focus}. None if it is not one."""
     if not TEST_REQUEST.search(cmd):
         return None
     app = browser()
     open_url = current_url(app) if agent.find_running(app) else ""
-    req = {"site": test_target(cmd) or "", "this_page": False, "page_hint": "", "focus": ""}
-    if gem is not None:
+    this_page = re.search(r"\b(this|current) (page|form|site)\b|\bbu (sayfa|form|site)|buradaki|şu an açık|açık olan", cmd, re.I)
+    loc = local_parse(cmd)
+    req = {"site": loc["site"] or "", "this_page": bool(this_page) and not loc["site"], "hops": loc["hops"],
+           "page_hint": " > ".join(loc["hops"]), "focus": ""}
+    if not req["site"] and not req["this_page"] and gem is not None:   # unusual wording: let Gemini read it
         try:
-            req = gem.qa_request(cmd, open_url) | ({"site": req["site"]} if req["site"] else {})
+            g = gem.qa_request(cmd, open_url)
+            req |= {"site": g.get("site", ""), "this_page": g.get("this_page", False),
+                    "hops": [g["page_hint"]] if g.get("page_hint") else [], "page_hint": g.get("page_hint", ""),
+                    "focus": g.get("focus", "")}
         except Exception:
             pass
     if GENERIC_FOCUS.match(req.get("focus") or ""):
@@ -690,23 +752,56 @@ def parse_request(cmd: str, gem) -> dict | None:
     if req.get("site"):
         m = URL_IN.search(req["site"])
         req["site"] = m.group(0) if m else req["site"].split("'")[0].split("’")[0]
-    if req.get("site") and urllib.parse.urlsplit(("https://" if "://" not in req["site"] else "") + req["site"]).path.strip("/"):
-        req["page_hint"], req["single_page"] = "", True   # a full page address: test that page
+    if req.get("site") and urllib.parse.urlsplit(("https://" if "://" not in req["site"] else "") + req["site"]).path.strip("/") \
+            and not req.get("hops"):
+        req["single_page"] = True   # a full page address: test that page
     if req.get("this_page"):
         if not open_url.startswith("http"):
             return {"error": "No web page is open in the browser to test."}
-        req["site"], req["page_hint"] = open_url, ""   # "the form here": it is on this page
+        req["focus"] = req["focus"] or req["page_hint"]   # "the form here": it is on this page
+        req["site"], req["page_hint"], req["hops"] = open_url, "", []
     if not req.get("site"):
         return {"error": "Which site? Say e.g. 'test example.com' or open the page and say 'test this page'."}
     return req
 
 
+HOP_GENERIC = {"form", "formu", "forms", "page", "pages", "sayfa", "sayfası", "sayfasi", "bölüm", "bölümü", "section",
+               "modül", "modülü", "module", "kısmı", "kismi", "tab", "sekme", "sekmesi"}
+
+
+def fold(text: str) -> list[str]:
+    """Words for matching, accents removed: 'İletişim' / 'iletisim', 'Araçlar' / 'araclar' are the same."""
+    import unicodedata
+    plain = "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
+    return re.findall(r"[a-z0-9]+", plain.replace("ı", "i"))
+
+
+def link_match(hint: str, link: dict) -> float:
+    """How clearly a link is the page the user named: its label or its address contains the words."""
+    want = [w for w in fold(hint) if len(w) > 1 and w not in {fold(g)[0] for g in HOP_GENERIC}]
+    if not want:
+        return 0.0
+    path = urllib.parse.urlsplit(link["url"]).path.replace("-", " ").replace("_", " ").replace("/", " ")
+    have = fold(link["label"] + " " + path)
+    hit = sum(1 for w in want if any(h.startswith(w[:6]) or w.startswith(h[:6]) for h in have if len(h) > 2))
+    return hit / len(want)
+
+
 def pick_link(client, app: str, hint: str, snap: dict) -> str | None:
-    """The link that leads to the page the user named ('login', 'kayıt ol'): Jev chooses among the links."""
+    """The link to the page the user named. A clear label / address match is taken at once (no model);
+    otherwise Jev chooses among the links."""
     from typesafe_sdk import Choice
+    if re.match(r"^/|^https?://", hint):   # an address or a path was given
+        return urllib.parse.urljoin(snap["url"], hint)
     links = [l for l in snap["links"] if l.get("url")][:120]
     if not links:
         return None
+    def rank(l):   # all words found; then found in the link's own text; then the higher-level page
+        label_only = link_match(hint, {"label": l["label"], "url": "https://x/"})
+        return (link_match(hint, l), label_only, -urllib.parse.urlsplit(l["url"]).path.count("/"), -len(l["label"]))
+    best = max(links, key=rank)
+    if link_match(hint, best) >= 0.99 or (link_match(hint, best) >= 0.6 and len(agent.tokens(hint)) > 1):
+        return best["url"]
     opts = {f"l{i}": f"{l['label']} ({urllib.parse.urlsplit(l['url']).path})" for i, l in enumerate(links)}
     opts["none"] = "None of these"
     a = agent.jev(client, {"user_wants_page": hint, "site": snap["url"]},
@@ -724,6 +819,8 @@ def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None) -> dict
         base_io.say(f"✗ {req['error']}")
         return {}
     focused = bool(req.get("this_page") or req.get("page_hint") or req.get("focus"))
+    if req.get("hops") and not req.get("focus"):
+        req["focus"] = req["hops"][-1]   # "kayıt formu" is also what to focus the tests on
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
     return run_session(req["site"], client, base_io, pages=1 if single else 6,
                        tests_per_page=5 if focused else 3, allow_submit=allow_submit,

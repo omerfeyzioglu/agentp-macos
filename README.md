@@ -86,6 +86,10 @@ Tell AgentP what to test in your own words, in the panel (⌥Space), and it test
 | `test the checkout form on shop.example.com` | Focuses every test on that feature |
 | `test this page` · `bu sayfayı test et` · `buradaki formu test et` | The page open in the browser right now |
 | `test shop.example.com/pricing` | That exact page |
+| `ford com tr kampanyalar sayfasını test et` | Spoken addresses work (`ford com tr`, `ford nokta com nokta tr`); the page is found by its link text or address |
+| `ford com tr > binek araçlar > kuga test et` | Clicks through the named pages in order, then tests the last one |
+
+Addresses and page names are resolved without a model: the link whose text or address contains the words is opened directly (accents and words like "page" / "form" / "sayfası" ignored), and Jev decides only when no link clearly matches. An address that does not exist is reported at once instead of being guessed.
 
 From the terminal: `./run.sh --test example.com --pages 8 --minutes 20 --no-submit --user qa@example.com`.
 
