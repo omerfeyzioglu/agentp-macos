@@ -50,6 +50,9 @@ ERROR_RE = re.compile(
     r"bad gateway|service unavailable|something went wrong|an (unexpected )?error (has )?occurred|"
     r"unexpected error|traceback \(most recent call last\)|uncaught (type|reference)error|"
     r"\[object object\]|undefined is not|cannot read propert", re.I)
+HARD_STOP = re.compile(r"\b(pay|payment|buy|purchase|place order|checkout|check out|subscribe|unsubscribe|"
+                       r"delete (my |your |the )?account|close (my |your )?account|deactivate|log ?out|sign ?out|"
+                       r"send money|transfer)\b", re.I)
 TEST_REQUEST = re.compile(r"^\s*(test|qa)\s+(\S+)|"
                           r"\b(test|qa)\b.*\b(feature|function|functionality|site|website|page)s?\b|"
                           r"fonksiyon(el)? test|functional test", re.I)
@@ -81,6 +84,8 @@ class QAIO:
     def confirm(self, msg: str, default_yes: bool = False) -> bool:
         if msg.startswith("Send?") and self.allow_submit and self.in_scope():
             return True   # submitting a form on the site under test, with test data
+        if msg.startswith("Press '") and self.in_scope() and not HARD_STOP.search(msg):
+            return True   # "Delete" / "Remove" inside the site under test is a feature to test
         self.blocked.append(re.sub(r"\s*\[.*\]\s*$", "", msg))
         return False      # quitting apps, typing into terminals, risky buttons: never during tests
 
@@ -188,9 +193,14 @@ def snapshot(app: str) -> dict:
 
 def screen_for_check(app: str) -> dict:
     snap = snapshot(app)
+    counts: dict[str, int] = {}
+    for it in agent.read_screen(app, dedupe=False):   # "two Delete buttons" needs the duplicates
+        if it.get("page") and it["role"] not in agent.READ_ROLES:
+            k = f"{agent.ROLE_NAMES.get(it['role'], it['role'])}: {it['label'][:60]}"
+            counts[k] = counts.get(k, 0) + 1
+    controls = [f"{k} ×{n}" if n > 1 else k for k, n in counts.items()]
     return {"url": snap["url"], "title": snap["title"], "headings": snap["headings"][:20],
-            "text_on_page": snap["texts"][:150], "buttons": snap["buttons"][:40], "fields": snap["fields"][:20],
-            "links": [l["label"] for l in snap["links"][:60]]}
+            "text_on_page": snap["texts"][:150], "controls_on_page": controls[:80], "fields": snap["fields"][:20]}
 
 
 def error_texts(snap: dict) -> list[str]:
@@ -363,6 +373,8 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
             st = fut.result(timeout=10)
         except Exception:
             st = "timeout"
+        if isinstance(st, int) and st in (401, 403):
+            continue   # needs a login: not a broken link
         if not isinstance(st, int) or st >= 400:
             issue("medium" if isinstance(st, int) and st == 404 else "low", page_url, f"Broken link ({st}): {label}", key)
     link_pool.shutdown(wait=False)
@@ -387,11 +399,16 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
            "screenshot": None}
     io.progress(f"    ▸ {test['title']}")
     for step in test["steps"]:
+        blocked_before = len(io.blocked)
         try:
             r = agent.handle(client, step, ctx)
         except Exception as e:
             r = {"ok": False, "steps": [f"error: {e}"]}
         rec["agent_steps"] += [f"{step} → {s}" for s in r.get("steps", [])] or [f"{step} → (nothing done)"]
+        if len(io.blocked) > blocked_before and HARD_STOP.search(io.blocked[-1]):
+            rec["status"] = "blocked"
+            rec["note"] = f"Not run for safety: '{step}' needs '{io.blocked[-1][:80]}'"
+            break
         if not r.get("ok"):
             rec["status"] = "error"
             why = io.blocked[-1] if io.blocked else (r.get("steps") or ["could not be done"])[-1]
@@ -402,7 +419,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
     if rec["status"] != "passed":
         rec["screenshot"] = screenshot(app, out_dir / f"test{number}.png")
     rec["duration_s"] = round(time.time() - t0, 1)
-    mark = {"passed": "✓", "failed": "✗", "error": "✗"}[rec["status"]]
+    mark = {"passed": "✓", "failed": "✗", "error": "✗", "blocked": "–"}[rec["status"]]
     conf = f" ({rec['confidence']:.2f})" if rec["confidence"] is not None else ""
     io.progress(f"     {mark} {rec['status']}{conf}" + (f" — {rec['note']}" if rec["status"] != "passed" else ""))
     return rec
@@ -417,6 +434,8 @@ def write_reports(r: dict, out: Path) -> dict:
         body = ""
         if t["status"] == "failed":
             body = f'<failure message="{xml_escape(t["note"], {chr(34): "&quot;"})}">{xml_escape(chr(10).join(t["agent_steps"]))}</failure>'
+        elif t["status"] == "blocked":
+            body = f'<skipped message="{xml_escape(t["note"], {chr(34): "&quot;"})}"/>'
         elif t["status"] == "error":
             body = f'<error message="{xml_escape(t["note"], {chr(34): "&quot;"})}">{xml_escape(chr(10).join(t["agent_steps"]))}</error>'
         cases.append(f'  <testcase classname="{xml_escape(t["page"])}" name="{xml_escape(t["title"])}" '
@@ -434,7 +453,7 @@ def write_reports(r: dict, out: Path) -> dict:
 def html_report(r: dict) -> str:
     e = lambda s: html.escape(str(s or ""))  # noqa: E731
     passed = sum(t["status"] == "passed" for t in r["tests"])
-    failed = len(r["tests"]) - passed
+    failed = sum(t["status"] in ("failed", "error") for t in r["tests"])
     sev_order = {"high": 0, "medium": 1, "low": 2}
     issues = sorted(r["issues"], key=lambda i: sev_order.get(i["severity"], 3))
     issue_rows = "".join(
@@ -533,7 +552,7 @@ def main():
                     Path(args.out) if args.out else None)
     if r.get("report"):
         subprocess.run(["open", r["report"]["html"]], check=False)
-    bad = [t for t in r.get("tests", []) if t["status"] != "passed"]
+    bad = [t for t in r.get("tests", []) if t["status"] in ("failed", "error")]
     sys.exit(1 if (bad or any(i["severity"] == "high" for i in r.get("issues", []))) else 0)
 
 

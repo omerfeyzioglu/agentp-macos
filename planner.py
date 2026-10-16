@@ -276,7 +276,8 @@ Rules: stay on {site}. Use made-up test data only (names like "QA Tester", email
 phone 5550000000). Never pay, buy, place orders, delete, unsubscribe, log out, change account settings,
 post publicly, or contact real people. {"Submitting forms with test data is allowed." if allow_submit
 else "Do not submit forms: test validation by leaving fields empty and observe inline messages only."}
-Prefer tests whose outcome is visible without logging in."""
+Prefer tests whose outcome is visible without logging in. Do not spend tests on merely opening a link to
+another page (the crawler visits pages by itself): test what the page DOES."""
         schema = {
             "type": "object",
             "properties": {

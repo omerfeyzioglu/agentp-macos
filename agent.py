@@ -541,7 +541,7 @@ def region_of(rect, win, in_page: bool = False) -> str | None:
     return "center"
 
 
-def read_screen(app_name: str) -> list[dict]:
+def read_screen(app_name: str, dedupe: bool = True) -> list[dict]:
     """Visible interactive elements of the app's window + its menu bar."""
     app = find_running(app_name)
     if not app:
@@ -596,6 +596,8 @@ def read_screen(app_name: str) -> list[dict]:
             (SCREENS_DIR / f"{app_name}.txt").write_text("\n".join(lines[:8000]), encoding="utf-8")
         except OSError:
             pass
+    if not dedupe:   # checks need counts ("two Delete buttons")
+        return items
     seen, uniq = set(), []
     for it in items:
         k = (it["role"], it["label"])
