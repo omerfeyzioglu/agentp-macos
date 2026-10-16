@@ -200,7 +200,21 @@ def goto(app: str, url: str) -> float:
             agent.wait_for_change(app, "", timeout=1.5)
         else:
             break
+    now = WINDOW.url()
+    if now and norm(now).split("?")[0] != norm(url).split("?")[0] and domain(now) != domain(url):
+        WINDOW.goto(url)   # something took the page away (e.g. a pressed link): back to the page under test
+        agent.wait_for_change(app, "", timeout=4.0, min_items=5)
     return loaded
+
+
+def malformed_url(u: str) -> bool:
+    """'https://www.ford.com.trhttps//twitter.com/x': a second address glued into the host or path
+    (query strings like ?url=https://… are fine)."""
+    if not u.startswith("http"):
+        return False
+    p = urllib.parse.urlsplit(u)
+    return bool(re.search(r"https?:?/", p.netloc + p.path[:1] if p.netloc else "") or re.search(r"https?:?/{1,2}", p.path)) \
+        or bool(re.search(r"\.[a-z]{2,}https?", p.netloc, re.I))
 
 
 def norm(url: str) -> str:
@@ -283,13 +297,13 @@ def form_fields(items: list[dict]) -> list[dict]:
     return out[:40]
 
 
-CONSENT_TEXT = re.compile(r"cookie|çerez|kvkk|gdpr|privacy|gizlilik|consent|onay", re.I)
+CONSENT_TEXT = re.compile(r"cookie|çerez", re.I)   # only an actual cookie notice, not a footer "Privacy" link
 CONSENT_PREFER = [   # the most privacy-preserving choice first
     re.compile(r"^(reject|decline|deny)( all)?$|^tümünü reddet$|^reddet$|only (necessary|essential)|sadece (gerekli|zorunlu)|"
                r"necessary only|yalnızca zorunlu|zorunlu (çerezler|olanlar)", re.I),
     re.compile(r"^(accept|agree|allow|ok|okay|got it|i agree|kabul( et)?|tümünü kabul et|tamam|anladım|onayla|"
                r"accept all|allow all|accept cookies|çerezleri kabul et)( all)?[.!]?$", re.I),
-    re.compile(r"^(close|kapat|×|✕|x)$", re.I),
+    # no "X" / "Close": too easily a social link (X/Twitter) or something unrelated
 ]
 
 
@@ -298,9 +312,11 @@ def dismiss_overlays(app: str) -> str | None:
     Prefers 'reject / only necessary'. Returns what was pressed."""
     items = agent.read_screen(app)
     page = [i for i in items if i.get("page")]
-    if not any(CONSENT_TEXT.search(i["label"]) for i in page):
+    notice = [i for i in page if i["role"] in agent.READ_ROLES and CONSENT_TEXT.search(i["label"])
+              and len(i["label"]) >= 25]   # a sentence about cookies, not a link label
+    if not notice:
         return None
-    buttons = [i for i in page if i.get("pressable") and i["role"] in ("AXButton", "AXLink")]
+    buttons = [i for i in page if i.get("pressable") and i["role"] == "AXButton"]   # buttons only, never links
     for pattern in CONSENT_PREFER:
         for b in buttons:
             if pattern.search(b["label"].split(" | ")[0].strip()):
@@ -514,6 +530,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     queue, visited, tested = [url], [], []
     link_pool = ThreadPoolExecutor(8)
     checked_links: dict[str, object] = {}
+    malformed: set[str] = set()
     deadline = t_start + minutes * 60
 
     while queue and len(result["pages"]) < pages and time.time() < deadline and not stopped():
@@ -540,6 +557,11 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
         if not domain(landed).endswith(scope):
             issue("medium", page_url, f"Redirected off the site to {landed}")
             continue
+        for link in snap["links"]:   # malformed addresses: a site bug whatever the target
+            u = link.get("url") or ""
+            if malformed_url(u) and u not in malformed:
+                malformed.add(u)
+                issue("medium", landed, f"Malformed link address: {link['label'][:40]}", u)
         for link in snap["links"]:   # broken links on the same site, checked in the background
             u = link.get("url")
             if u and u.startswith("http") and domain(u).endswith(scope) and norm(u) not in checked_links \
