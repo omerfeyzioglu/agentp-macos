@@ -545,6 +545,21 @@ def region_of(rect, win, in_page: bool = False) -> str | None:
     return "center"
 
 
+PREFERRED_WINDOW = None   # callable → a window title to read instead of the focused window (qa.py's test window)
+
+
+def target_window(root):
+    """The window to read: the preferred one by title when set (a screen-sharing bar or another window may
+    have the focus), else the focused window, else the first one."""
+    if PREFERRED_WINDOW is not None:
+        want = (PREFERRED_WINDOW() or "")[:30]
+        if want:
+            for w in ax(root, "AXWindows") or []:
+                if want in str(ax(w, "AXTitle") or ""):
+                    return w
+    return ax(root, "AXFocusedWindow") or next(iter(ax(root, "AXWindows") or []), None)
+
+
 def read_screen(app_name: str, dedupe: bool = True) -> list[dict]:
     """Visible interactive elements of the app's window + its menu bar."""
     app = find_running(app_name)
@@ -555,7 +570,7 @@ def read_screen(app_name: str, dedupe: bool = True) -> list[dict]:
     AXUIElementSetAttributeValue(root, "AXManualAccessibility", True)
     AXUIElementSetAttributeValue(root, "AXEnhancedUserInterface", True)
     items, lines = [], []
-    win = ax(root, "AXFocusedWindow") or next(iter(ax(root, "AXWindows") or []), None)
+    win = target_window(root)
     win_rect = ax_rect(win) if win is not None else None
 
     def walk(el, d=0, in_page=False):
@@ -711,7 +726,7 @@ def where_am_i(app_name: str) -> str:
     app = find_running(app_name)
     if not app:
         return "none"
-    win = ax(AXUIElementCreateApplication(app.processIdentifier()), "AXFocusedWindow")
+    win = target_window(AXUIElementCreateApplication(app.processIdentifier()))
     title = ax(win, "AXTitle") if win is not None else None
     info = f"{app_name} — window: {title!r}" if title else app_name
     script = (f'tell application "{app_name}" to get URL of front document' if app_name == "Safari"

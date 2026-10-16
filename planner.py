@@ -276,9 +276,15 @@ Forms: page.form_fields lists every field with its kind (text, email, password, 
 textarea, select, checkbox, radio) and whether it is required. For a form test put the data in "fill":
 one entry per field, "field" = the exact field label from form_fields, "value" = what to enter (for a
 select the option text, for a checkbox "check" or "uncheck", "" to leave a field empty on purpose). Use
-realistic values that fit each field's kind. Then "steps" only submits (e.g. "click the 'Register'
-button"). Cover one fully valid submission and the invalid cases that matter for that form: required
-fields left empty, malformed email, too short password, letters in a number field.
+realistic values that fit each field's kind and the site's country (e.g. Turkish plate "34 ABC 123",
+phone "5321234567"). Then "steps" only submits (e.g. "click the 'İLERİ' button").
+Test a form like a careful QA engineer, one rule per test:
+  - one fully valid submission that should succeed or move the flow forward (mark it advances=true);
+  - each required field left empty on its own (all other fields valid), most important ones first;
+  - format rules per field kind: malformed email, letters / too few digits in a phone, invalid plate or
+    ID patterns, out-of-range numbers or dates, too short password;
+  - a required checkbox (consent, terms) left unchecked;
+  - boundaries: very long input (100+ characters), leading/trailing spaces, Turkish characters (ğüşıöç).
 {"A test account exists: for login forms use the values {{username}} and {{password}} exactly as written."
  if has_account else "No test account is available: test login forms only with wrong credentials."}
 
@@ -298,7 +304,9 @@ another page (the crawler visits pages by itself): test what the page DOES."""
                     "fill": {"type": "array", "items": {"type": "object", "properties": {
                         "field": {"type": "string"}, "value": {"type": "string"}}, "required": ["field", "value"]}},
                     "steps": {"type": "array", "items": {"type": "string"}},
-                    "expect": {"type": "string"}},
+                    "expect": {"type": "string"},
+                    "advances": {"type": "boolean", "description": "true if passing this test reaches a new step, "
+                                 "page or state that should be tested further (e.g. step 2 of a form)"}},
                     "required": ["title", "kind", "steps", "expect"]}},
                 "next_pages": {"type": "array", "items": {"type": "object", "properties": {
                     "label": {"type": "string"}, "why": {"type": "string"}}, "required": ["label"]}},

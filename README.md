@@ -95,6 +95,8 @@ From the terminal: `./run.sh --test example.com --pages 8 --minutes 20 --no-subm
 
 **Forms.** Every field is read with its kind (text, email, password, phone, date, number, textarea, select, checkbox, radio) and whether it is required. Gemini writes realistic test data per field and covers one valid submission plus the invalid cases that matter (required fields empty, malformed email, short password, letters in a number). Fields are filled directly by label, without a decision step per field; selects are chosen, checkboxes ticked, fields deliberately left empty for validation tests.
 
+**Deep flows.** A test that moves the flow forward (a valid step-1 submission of a multi-step form, for example) is followed by tests of the state it reached: step 2, then step 3, up to three levels. Each follow-up starts clean: the page is reloaded and the tests that led there are replayed. A page tested on its own gets up to 8 tests: one rule per test (each required field, format rules per field kind, required checkboxes, long input, Turkish characters).
+
 **Test account.** For login-protected areas set `AGENTP_TEST_USER` / `AGENTP_TEST_PASSWORD` (or `--user`). Gemini never sees the credentials, only the placeholders `{{username}}` / `{{password}}`; the values are filled in locally and the password is masked in every report.
 
 For each page, starting from the address and staying on that site:

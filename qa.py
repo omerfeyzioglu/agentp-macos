@@ -164,6 +164,8 @@ class TestWindow:
         return bool(mine) and mine[:30] in wtitle
 
     def ensure_front(self):
+        """Raise the test window. Reading no longer depends on focus (the window is found by title),
+        but clicks by position and typed keys need it on top."""
         for _ in range(3):
             self.front()
             time.sleep(0.25)
@@ -467,6 +469,38 @@ def resolve_target(target: str, gem) -> str | None:
     return None
 
 
+FOLLOW_UPS = 4      # tests on each new state a passing test reaches (e.g. step 2 of a form)
+MAX_DEPTH = 3       # how many states deep (step 2, step 3, step 4)
+
+
+def follow_up(client, gem, ctx, io, app, page_url, prefix, result, tested, visited, out_dir, account,
+              allow_submit, deadline, stopped, depth):
+    """A test reached a new step / state: plan tests for it and run them, each starting from that state."""
+    if depth > MAX_DEPTH or time.time() > deadline or stopped():
+        return
+    snap = snapshot(app)   # the state the last test of `prefix` reached
+    io.progress(f"  ↳ new state after '{prefix[-1]['title']}': testing it")
+    try:
+        ideas = gem.test_ideas(domain(page_url), {k: snap[k] for k in ("url", "title", "headings", "buttons", "form_fields")}
+                               | {"links": [l["label"] for l in snap["links"]], "texts": snap["texts"][:60]},
+                               tested, visited, FOLLOW_UPS, allow_submit, bool(account),
+                               f"the state reached after: {' → '.join(t['title'] for t in prefix)} "
+                               "(e.g. the next step of the form); test only what is new there")
+    except Exception as e:
+        io.progress(f"  (could not plan follow-up tests: {str(e)[:60]})")
+        return
+    for test in ideas["tests"]:
+        if time.time() > deadline or stopped():
+            return
+        goto(app, page_url)   # each follow-up starts clean: page, then the tests that led here
+        rec = run_test(client, gem, ctx, io, app, page_url, test, out_dir, len(result["tests"]) + 1, account, prefix)
+        result["tests"].append(rec)
+        tested.append(f"{' → '.join(t['title'] for t in prefix)} → {test['title']}")
+        if rec["status"] == "passed" and test.get("advances"):
+            follow_up(client, gem, ctx, io, app, page_url, prefix + [test], result, tested, visited, out_dir,
+                      account, allow_submit, deadline, stopped, depth + 1)
+
+
 def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 15, tests_per_page: int = 3,
                 allow_submit: bool = True, out_dir: Path | None = None, account: dict | None = None,
                 focus: str = "", page_hint: str = "", stop=None) -> dict:
@@ -491,6 +525,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     app = browser()
     try:
         WINDOW = TestWindow(app, url)   # its own window: the user's tabs are never touched
+        agent.PREFERRED_WINDOW = WINDOW.title   # read the test window even when another one has the focus
     except RuntimeError as e:
         base_io.say(f"✗ {e}")
         return {}
@@ -586,6 +621,9 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
                 goto(app, landed)   # every test starts from the page itself
             result["tests"].append(run_test(client, gem, ctx, io, app, landed, test, out_dir,
                                             len(result["tests"]) + 1, account))
+            if result["tests"][-1]["status"] == "passed" and test.get("advances") and gem is not None:
+                follow_up(client, gem, ctx, io, app, landed, [test], result, tested, visited, out_dir,
+                          account, allow_submit, deadline, stopped, depth=1)
             tested.append(f"{snap['title']}: {test['title']}")
             page["tests"] += 1
             last = result["tests"][-1]
@@ -624,6 +662,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     result["links_checked"] = len(checked_links)
     paths = write_reports(result, out_dir)
     WINDOW = None   # the test window stays open for the user to look at; the session is over
+    agent.PREFERRED_WINDOW = None
     passed = sum(t["status"] == "passed" for t in result["tests"])
     io.progress(f"  Done in {result['duration_s'] // 60} min {result['duration_s'] % 60} s: {len(result['pages'])} pages, "
                 f"{passed}/{len(result['tests'])} tests passed, {len(result['issues'])} issues")
@@ -660,6 +699,20 @@ def best_field(name: str, fields: list[dict]) -> dict | None:
 
     best = max(fields, key=score)
     return best if score(best) > 0 else None
+
+
+def set_value(it: dict, value: str, ctx) -> bool:
+    """Put text into a field through the accessibility API (no keyboard focus needed: a screen-sharing
+    bar or another window may hold it). True if the field now holds the value."""
+    el = it.get("el")
+    if el is None or ctx is None or ctx.dry_run:
+        return False
+    agent.reveal(it)
+    agent.AXUIElementSetAttributeValue(el, "AXFocused", True)
+    if agent.AXUIElementSetAttributeValue(el, "AXValue", value) != 0:
+        return False
+    got = agent.ax(el, "AXValue")
+    return isinstance(got, str) and got.strip() == value.strip()
 
 
 def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[str]:
@@ -705,7 +758,8 @@ def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[st
             agent.key(51, ctx)   # leave it empty on purpose (validation tests)
             done.append(f"cleared '{it['label'][:40]}'")
         else:
-            agent.execute({"action": "type", "element": it, "text": value}, f"type {name}", ctx)
+            if not set_value(it, value, ctx):   # focus-independent first; typing as a fallback
+                agent.execute({"action": "type", "element": it, "text": value}, f"type {name}", ctx)
             shown = "••••••" if kind == "password" or (account and value == account.get("password")) else value[:40]
             done.append(f"filled '{it['label'][:40]}' = {shown}")
         time.sleep(0.2)
@@ -770,8 +824,25 @@ def direct_step(step: str, ctx, app: str) -> list[str] | None:
     return [f"clicked '{best['label'][:50]}'" + ("" if changed else " (but no change on screen)")]
 
 
+def replay(prefix: list[dict], client, ctx, app: str, account: dict | None) -> bool:
+    """Bring the page back to the state a follow-up test starts from: redo the tests that led there."""
+    for t in prefix:
+        try:
+            if t.get("fill"):
+                fill_form(t["fill"], ctx, app, account)
+            for step in t["steps"]:
+                step = secret(step, account)
+                done = direct_step(step, ctx, app)
+                if done is None and not agent.handle(client, step, ctx).get("ok"):
+                    return False
+        except Exception:
+            return False
+    time.sleep(1.0)
+    return True
+
+
 def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir: Path, number: int,
-             account: dict | None = None) -> dict:
+             account: dict | None = None, prefix: list[dict] | None = None) -> dict:
     t0 = time.time()
     io.lines, io.blocked = [], []
     ctx.history.clear()
@@ -780,9 +851,13 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
            "expect": test["expect"], "status": "", "confidence": None, "note": "", "agent_steps": [],
            "screenshot": None}
     io.progress(f"    ▸ {test['title']}")
+    if prefix:
+        rec["after"] = " → ".join(t["title"] for t in prefix)
+        if not replay(prefix, client, ctx, app, account):
+            rec["status"], rec["note"] = "error", f"Could not reach the starting state: {rec['after']}"
     rec["fill"] = [{"field": f.get("field"), "value": masked(secret(str(f.get("value", "")), account), account)}
                    for f in test.get("fill") or []]
-    if test.get("fill"):
+    if test.get("fill") and not rec["status"]:
         if WINDOW is not None:
             WINDOW.ensure_front()
         try:
@@ -865,6 +940,7 @@ def html_report(r: dict) -> str:
         f'<details class="test {e(t["status"])}"><summary><span class="dot"></span><b>{e(t["title"])}</b>'
         f'<span class="muted"> · {e(t["kind"])} · {t.get("duration_s", 0)} s</span><span class="st">{e(t["status"])}</span></summary>'
         f'<div class="body"><div class="muted url">{e(t["page"])}</div>'
+        f'{"<p class=muted>Starts after: " + e(t["after"]) + "</p>" if t.get("after") else ""}'
         f'{"<h4>Form data</h4><ul>" + "".join("<li>" + e(f["field"]) + " = " + (e(f["value"]) or "<i>empty</i>") + "</li>" for f in t.get("fill", [])) + "</ul>" if t.get("fill") else ""}'
         f'<h4>Steps</h4><ul>{"".join("<li>" + e(s) + "</li>" for s in t["steps"])}</ul>'
         f'<h4>Expected</h4><p>{e(t["expect"])}</p>'
@@ -1054,7 +1130,7 @@ def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None, stop=No
         req["focus"] = req["hops"][-1]   # "kayıt formu" is also what to focus the tests on
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
     return run_session(req["site"], client, base_io, pages=1 if single else 6,
-                       tests_per_page=5 if focused else 3, allow_submit=allow_submit,
+                       tests_per_page=8 if focused else 3, allow_submit=allow_submit,
                        focus=req.get("focus", ""), page_hint=req.get("page_hint", ""), stop=stop)
 
 
@@ -1102,7 +1178,8 @@ def main():
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
     focus = req.get("focus") or (req["hops"][-1] if req.get("hops") else "")
     r = run_session(req["site"], TypeSafeClient(), agent.CliIO(), 1 if single and args.pages == 6 else args.pages,
-                    args.minutes, args.tests, allow, Path(args.out) if args.out else None, account,
+                    args.minutes, 8 if single and args.tests == 3 else args.tests, allow,
+                    Path(args.out) if args.out else None, account,
                     focus=focus, page_hint=req.get("page_hint", ""))
     if r.get("report"):
         subprocess.run(["open", r["report"]["html"]], check=False)
