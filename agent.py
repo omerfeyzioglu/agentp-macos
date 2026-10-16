@@ -150,13 +150,16 @@ ROLES = {"AXButton", "AXMenuButton", "AXPopUpButton", "AXCheckBox", "AXRadioButt
          "AXMenuItem", "AXTab", "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField",
          "AXCell", "AXRow", "AXStaticText", "AXHeading", "AXImage"}
 TEXT_ROLES = {"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"}
+CLICKABLE_BOXES = {"AXGroup", "AXListItem", "AXGenericElement", "AXSection", "AXArticle"}   # web cards, result rows
 READ_ROLES = {"AXStaticText", "AXHeading"}
 ROLE_NAMES = {"AXButton": "button", "AXMenuButton": "menu button", "AXPopUpButton": "popup menu",
               "AXCheckBox": "checkbox", "AXRadioButton": "tab/option", "AXLink": "link",
               "AXMenuItem": "menu", "AXTab": "tab", "AXTextField": "TEXT BOX",
               "AXTextArea": "TEXT BOX", "AXComboBox": "TEXT BOX", "AXSearchField": "SEARCH BOX",
               "AXCell": "list row", "AXRow": "list row", "AXStaticText": "text",
-              "AXHeading": "heading", "AXImage": "image"}
+              "AXHeading": "heading", "AXImage": "image", "AXGroup": "clickable item",
+              "AXListItem": "list item", "AXGenericElement": "clickable item", "AXSection": "clickable item",
+              "AXArticle": "clickable item"}
 RISKY = re.compile(r"\b(delete|remove|pay|buy|purchase|order|log ?out|sign ?out|empty|format|uninstall)\b", re.I)
 SENDY = re.compile(r"\b(send|submit|post|share|reply|message)\b", re.I)
 SEARCHY = re.compile(r"search|find|play|filter|look ?up", re.I)
@@ -232,6 +235,7 @@ class Ctx:
     url_opener: object = None        # open_url goes here instead of a new tab (qa.py: its own test window)
     blocked: frozenset = frozenset() # actions / shortcuts not allowed (qa.py: never close or quit anything)
     stop: object = None              # callable: True when the user asked to stop (Esc / menu)
+    max_steps: int | None = None     # cap for this request (qa.py adapting); None = MAX_STEPS
     last_answer: str | None = None   # result of the last summarize step ({answer} in typed text)
 
 
@@ -560,6 +564,25 @@ def target_window(root):
     return ax(root, "AXFocusedWindow") or next(iter(ax(root, "AXWindows") or []), None)
 
 
+def inner_text(el, limit: int = 90) -> str:
+    """The visible text inside an element (a card's title, address, price…), for elements without a label."""
+    out: list[str] = []
+
+    def walk(e, d=0):
+        if d > 6 or sum(len(t) for t in out) > limit:
+            return
+        role = ax(e, "AXRole")
+        if role in ("AXStaticText", "AXHeading", "AXLink"):
+            t = ax_label(e, role)
+            if t and t not in out:
+                out.append(t)
+        for k in ax(e, "AXChildren") or []:
+            walk(k, d + 1)
+
+    walk(el)
+    return " · ".join(out)[:limit]
+
+
 def read_screen(app_name: str, dedupe: bool = True) -> list[dict]:
     """Visible interactive elements of the app's window + its menu bar."""
     app = find_running(app_name)
@@ -578,6 +601,15 @@ def read_screen(app_name: str, dedupe: bool = True) -> list[dict]:
             return
         role = ax(el, "AXRole") or "?"
         lb = ax_label(el, role)
+        if role in CLICKABLE_BOXES and in_page and len(items) < 1400:
+            # a clickable card / result row (a div with a click handler): labelled by the text inside it
+            acts = ax_actions(el)
+            if "AXPress" in acts:
+                text = lb or inner_text(el)
+                reg = region_of(ax_rect(el), win_rect, in_page) if text else None
+                if reg is not None:
+                    items.append({"el": el, "role": role, "label": text, "region": reg, "pressable": True,
+                                  "page": in_page, "order": len(items), "offscreen": reg in ("above", "below")})
         if role in ROLES and lb and ax(el, "AXEnabled") is not False:
             acts = ax_actions(el)
             if role in TEXT_ROLES or role in READ_ROLES or "AXPress" in acts:
@@ -1492,7 +1524,7 @@ def handle(client, cmd: str, ctx: Ctx) -> dict:
         ctx.history.append({"request": cmd, "steps": ["not done: the planner could not do it as asked"]})
         return {"ok": False, "steps": [], "total_ms": (time.perf_counter() - t0) * 1000}
 
-    for n in range(1, MAX_STEPS + 1):
+    for n in range(1, (ctx.max_steps or MAX_STEPS) + 1):
         if ctx.stop is not None and ctx.stop():
             say("  Stopped.")
             break

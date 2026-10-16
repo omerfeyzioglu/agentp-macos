@@ -409,6 +409,8 @@ def screenshot(app: str, path: Path) -> str | None:
 
 # ---------------------------------------------------------------- checking a result
 NEGATIVE = re.compile(r"does not (move|advance|proceed|go)|not (move|advance|proceed)|stays? on|remains? on", re.I)
+NO_ADAPT = re.compile(r"no (dealers?|results?|items?|products?|matches|records?)|not found|nothing (is )?found|"
+                      r"error|warning|invalid|validation|rejected|empty (result|list)", re.I)   # nothing to work around
 
 
 def split_expectation(expect: str) -> tuple[str, str]:
@@ -526,6 +528,7 @@ def follow_up(client, gem, ctx, io, app, page_url, prefix, result, tested, visit
         goto(app, page_url)   # each follow-up starts clean: page, then the tests that led here
         rec = run_test(client, gem, ctx, io, app, page_url, test, out_dir, len(result["tests"]) + 1, account, prefix)
         result["tests"].append(rec)
+        test["_adapted"] = bool(rec.get("adapted"))
         if rec.get("ux"):
             result["issues"].append({"severity": "low", "page": page_url, "what": "No feedback for invalid input",
                                      "detail": f"{test['title']}: {rec['ux']}", "screenshot": None})
@@ -547,6 +550,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     if gem is not None:
         gem.grounding = False   # test data like "QA Tester" must not be looked up on the web
     ctx.planner = None          # each test step is one UI action: Jev does it, nothing to plan
+    ctx.qa_gem = gem            # for replaying tests that needed adapting
     url = resolve_target(target, gem)
     if not url:
         base_io.say(f"✗ Could not find the site '{target}'. Give its address, e.g. test example.com")
@@ -655,6 +659,7 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
                 goto(app, landed)   # every test starts from the page itself
             result["tests"].append(run_test(client, gem, ctx, io, app, landed, test, out_dir,
                                             len(result["tests"]) + 1, account))
+            test["_adapted"] = bool(result["tests"][-1].get("adapted"))
             if result["tests"][-1]["status"] == "passed" and test.get("advances") and gem is not None:
                 follow_up(client, gem, ctx, io, app, landed, [test], result, tested, visited, out_dir,
                           account, allow_submit, deadline, stopped, depth=1)
@@ -923,7 +928,7 @@ def prepare(test: dict, prefix: list[dict], page_url: str, client, ctx, app: str
                 break
             WINDOW.reset(page_url)
             goto(app, page_url)
-        if prefix and not replay(prefix, client, ctx, app, account):
+        if prefix and not replay(prefix, client, ctx, app, account, getattr(ctx, "qa_gem", None)):
             continue
         if state_ready(test, app):
             return None
@@ -942,7 +947,7 @@ def adapt(client, gem, ctx, io, app: str, test: dict) -> list[str]:
     goal = (f"On this page, reach this goal: {test['title']}. The expected result is: {test['expect']}. "
             "Some steps were already done: " + "; ".join(test.get("steps", [])) + ". Use what the page shows "
             "now (a suggestion list, an option, a button) to finish. Use made-up test data only.")
-    saved, ctx.planner = ctx.planner, gem
+    saved, ctx.planner, ctx.max_steps = ctx.planner, gem, 4   # a few steps, not a new session
     io.progress("       ↺ adapting to the page")
     try:
         r = agent.handle(client, goal, ctx)
@@ -950,11 +955,12 @@ def adapt(client, gem, ctx, io, app: str, test: dict) -> list[str]:
     except Exception:
         return []
     finally:
-        ctx.planner = saved
+        ctx.planner, ctx.max_steps = saved, None
 
 
-def replay(prefix: list[dict], client, ctx, app: str, account: dict | None) -> bool:
-    """Bring the page back to the state a follow-up test starts from: redo the tests that led there."""
+def replay(prefix: list[dict], client, ctx, app: str, account: dict | None, gem=None) -> bool:
+    """Bring the page back to the state a follow-up test starts from: redo the tests that led there.
+    A test that only passed by adapting is redone the same way (its steps alone do not get there)."""
     for t in prefix:
         try:
             if t.get("fill"):
@@ -963,6 +969,9 @@ def replay(prefix: list[dict], client, ctx, app: str, account: dict | None) -> b
                 step = secret(step, account)
                 done = direct_step(step, ctx, app)
                 if done is None and not agent.handle(client, step, ctx).get("ok"):
+                    if t.get("_adapted") and gem is not None:
+                        adapt(client, gem, ctx, ctx.io, app, t)
+                        break
                     return False
         except Exception:
             return False
@@ -1016,8 +1025,18 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             rec["note"] = f"Not run for safety: '{step}' needs '{io.blocked[-1][:80]}'"
             break
         if not r.get("ok"):
-            rec["status"] = "error"
             why = io.blocked[-1] if io.blocked else (r.get("steps") or ["could not be done"])[-1]
+            hard = split_expectation(test["expect"])[0]
+            if gem is not None and not io.blocked and not (NEGATIVE.search(hard) or NO_ADAPT.search(hard)):
+                adapted = adapt(client, gem, ctx, io, app, test)   # this step did not work: reach the goal another way
+                if adapted:
+                    rec["agent_steps"] += [f"adapted → {x}" for x in adapted]
+                    st, conf, _ = check(client, gem, app, hard, before)
+                    if st == "passed":
+                        rec["status"], rec["confidence"], rec["adapted"] = "passed", conf, True
+                        rec["note"] = f"Step '{step}' did not work as written; reached by adapting: " + "; ".join(adapted[-4:])
+                        break
+            rec["status"] = "error"
             rec["note"] = masked(f"Step could not be completed: '{step}' — {why}", account)
             break
     if not rec["status"]:
@@ -1029,7 +1048,8 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             st, _, _ = check(client, gem, app, soft, before)
             if st != "passed":
                 rec["ux"] = f"No visible feedback: expected '{soft}'"
-        elif rec["status"] == "failed" and gem is not None and not NEGATIVE.search(hard) and not stopped_now(ctx):
+        elif rec["status"] == "failed" and gem is not None and not (NEGATIVE.search(hard) or NO_ADAPT.search(hard)) \
+                and not stopped_now(ctx):
             adapted = adapt(client, gem, ctx, io, app, test)   # a person would use what the page shows
             if adapted:
                 rec["agent_steps"] += [f"adapted → {s}" for s in adapted]
