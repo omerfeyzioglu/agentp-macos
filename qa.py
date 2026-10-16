@@ -53,7 +53,7 @@ ERROR_RE = re.compile(
 HARD_STOP = re.compile(r"\b(pay|payment|buy|purchase|place order|checkout|check out|subscribe|unsubscribe|"
                        r"delete (my |your |the )?account|close (my |your )?account|deactivate|log ?out|sign ?out|"
                        r"send money|transfer)\b", re.I)
-TEST_REQUEST = re.compile(r"^\s*(test|qa)\b|\b(test|qa) (this|the|it|that|its|my|our)\b|"
+TEST_REQUEST = re.compile(r"^\s*(test|qa)\b|--test\b|\b(test|qa) (this|the|it|that|its|my|our)\b|"
                           r"\b(test|qa)\b.*\b(feature|function|functionality|site|website|page|form)s?\b|"
                           r"\btest (et|eder|edin|edebilir|yap)|\btestini|\btestlerini|fonksiyon(el)? test|"
                           r"functional test|\bqa\b", re.I)
@@ -447,6 +447,11 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
         if not found:
             io.progress(f"  (no link to '{hop}' on {current_url(app) or url}; testing from here)")
             break
+        st = http_status(found)
+        if not isinstance(st, int) or st >= 400:
+            io.progress(f"  ✗ '{hop}' leads to {found} which returns {st}; testing from {url} instead")
+            issue("medium", url, f"Page '{hop}' not found ({st})", found)
+            break
         io.progress(f"  → {hop}: {found}")
         url = found
 
@@ -767,9 +772,14 @@ kontrol tüm bütün whole all everything bu şu buradaki burada here this curre
 PATH_SEP = re.compile(r"\s*(?:>|→|->|»| sonra | then )\s*", re.I)
 
 
+CLI_NOISE = re.compile(r"(?:^|\s)(?:\.?/?run\.sh|python3?|\.venv/bin/python|qa\.py)(?=\s|$)|"
+                       r"(?:^|\s)--[\w-]+(?:[ =]\d+(?:\.\d+)?)?(?=\s|$)", re.I)
+
+
 def local_parse(cmd: str) -> dict:
     """No model: 'ford com tr kampanyalar sayfasını test et' → ford.com.tr + page 'kampanyalar'.
     'ford com tr > binek araçlar > kuga' → a path of pages to click through."""
+    cmd = CLI_NOISE.sub(" ", cmd)   # "./run.sh --test ford.com.tr" pasted into the panel
     text = re.sub(r"\b(nokta|dot)\b", ".", cmd, flags=re.I)
     m = URL_IN.search(text)
     site, rest = None, text
@@ -787,7 +797,7 @@ def local_parse(cmd: str) -> dict:
     rest = re.sub(r"^['’]?\w{0,3}\b", "", rest.strip()) if rest.strip()[:1] in "'’" else rest   # "'nin"
     hops = []
     for part in PATH_SEP.split(rest):
-        words = [w for w in re.findall(r"[\w/-]+", part) if w.casefold() not in FILLER]
+        words = [w for w in re.findall(r"(?<![\w.])/[\w/-]+|[\w-]+", part) if w.casefold() not in FILLER]
         if words:
             hops.append(" ".join(words))
     return {"site": site, "hops": hops}
