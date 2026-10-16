@@ -95,6 +95,8 @@ From the terminal: `./run.sh --test example.com --pages 8 --minutes 20 --no-subm
 
 **Forms.** Every field is read with its kind (text, email, password, phone, date, number, textarea, select, checkbox, radio) and whether it is required. Gemini writes realistic test data per field and covers one valid submission plus the invalid cases that matter (required fields empty, malformed email, short password, letters in a number). Fields are filled directly by label, without a decision step per field; selects are chosen, checkboxes ticked, fields deliberately left empty for validation tests.
 
+**State awareness.** Before every test the agent looks at the page instead of assuming its state: sites often remember a form's step across reloads. If the test's starting fields are already there it starts; if not, it replays the steps that lead there; if the site is stuck in another state, it starts over in a fresh private (incognito) window, which has no remembered state. The result check sees the screen before and after the test, so "the form did not move on" can be verified.
+
 **Deep flows.** A test that moves the flow forward (a valid step-1 submission of a multi-step form, for example) is followed by tests of the state it reached: step 2, then step 3, up to three levels. Each follow-up starts clean: the page is reloaded and the tests that led there are replayed. A page tested on its own gets up to 8 tests: one rule per test (each required field, format rules per field kind, required checkboxes, long input, Turkish characters).
 
 **Test account.** For login-protected areas set `AGENTP_TEST_USER` / `AGENTP_TEST_PASSWORD` (or `--user`). Gemini never sees the credentials, only the placeholders `{{username}}` / `{{password}}`; the values are filled in locally and the password is masked in every report.
@@ -107,7 +109,7 @@ For each page, starting from the address and staying on that site:
 4. **AgentP runs the steps** with the normal agent loop, and **Jev checks the expected result** on screen (Gemini decides only when Jev is unsure).
 5. **Go deeper** into the most important unvisited pages.
 
-Your browser: the session opens its **own browser window** and works only there; your other windows and tabs are never navigated, read or closed, and closing tabs / windows or quitting apps is not allowed during a test. Press **Esc** in the panel (or **P → Stop Current Task**) to stop; the report is still written for what was tested.
+Your browser: the session opens its **own browser window** (incognito in Chrome-family browsers) and works only there; your other windows and tabs are never navigated, read or closed, and closing tabs / windows or quitting apps is not allowed during a test. Press **Esc** in the panel (or **P → Stop Current Task**) to stop; the report is still written for what was tested.
 
 Safety: made-up test data only; never pays, buys, deletes, logs out or contacts anyone; never leaves the site. Form submission is asked once at the start (`--no-submit` tests validation only).
 

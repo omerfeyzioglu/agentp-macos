@@ -120,17 +120,34 @@ class TestWindow:
         if not agent.find_running(app):
             subprocess.run(["open", "-a", app], check=False)
             time.sleep(2.0)
+        self.private = not self.safari
+        self.id = self._open(url)
+
+    def _open(self, url: str) -> str:
+        """A new window at url. Chromium: incognito, so the site starts with no remembered state
+        (forms that remember their step, logins, carts) and the user's own session is not used."""
         u = url.replace('"', '%22')
         if self.safari:
             wid = osa_get(f'tell application "Safari"\nmake new document with properties {{URL:"{u}"}}\n'
                           'return id of front window\nend tell')
         else:
-            wid = osa_get(f'tell application "{app}"\nset w to make new window\nset URL of active tab of w to "{u}"\n'
-                          'return id of w\nend tell')
+            props = ' with properties {mode:"incognito"}' if self.private else ""
+            wid = osa_get(f'tell application "{self.app}"\nset w to make new window{props}\n'
+                          f'set URL of active tab of w to "{u}"\nreturn id of w\nend tell')
+            if not wid.isdigit() and self.private:   # incognito disabled (e.g. by policy): a normal window
+                self.private = False
+                return self._open(url)
         if not wid.isdigit():
-            raise RuntimeError(f"could not open a test window in {app} (allow AgentP to control {app} "
+            raise RuntimeError(f"could not open a test window in {self.app} (allow AgentP to control {self.app} "
                                "in System Settings → Privacy & Security → Automation)")
-        self.id = wid
+        return wid
+
+    def reset(self, url: str):
+        """Start over with a clean site state: close this window and open a fresh private one. Incognito
+        data is dropped when the last incognito window closes, so the old one is closed first."""
+        osa_get(f'tell application "{self.app}" to close {self._ref()}')
+        time.sleep(0.4)
+        self.id = self._open(url)
 
     def _ref(self) -> str:
         return f"(first window whose id is {self.id})"
@@ -391,14 +408,17 @@ def screenshot(app: str, path: Path) -> str | None:
 
 
 # ---------------------------------------------------------------- checking a result
-def check(client, gem, app: str, expectation: str) -> tuple[str, float, str]:
+def check(client, gem, app: str, expectation: str, before: dict | None = None) -> tuple[str, float, str]:
     """Is the expected result on screen? Jev answers yes/no with a probability; polled for a few
     seconds (results appear asynchronously); Gemini decides only when Jev stays unsure."""
     from typesafe_sdk import Noul
     t0, p, screen = time.time(), 0.5, {}
     while time.time() - t0 < CHECK_TIMEOUT:
         screen = screen_for_check(app)
-        a = agent.jev(client, {"functional_test_check": expectation, "screen": screen},
+        state = {"functional_test_check": expectation, "screen_now": screen}
+        if before:   # "did the form move on?" needs the screen before the test
+            state["screen_before_the_test"] = before
+        a = agent.jev(client, state,
                       {"ok": Noul(instructions="The screen shows this expected result of the test: " + expectation)},
                       {}, "check")
         p = a["ok"].noul or 0
@@ -409,7 +429,7 @@ def check(client, gem, app: str, expectation: str) -> tuple[str, float, str]:
         time.sleep(1.0)
     if gem is not None and FAIL < p < PASS:
         try:
-            ok, reason = gem.judge(expectation, screen)
+            ok, reason = gem.judge(expectation, {"before_the_test": before, "now": screen} if before else screen)
             return ("passed" if ok else "failed"), p, f"second opinion: {reason}"
         except Exception:
             pass
@@ -851,6 +871,50 @@ def direct_step(step: str, ctx, app: str) -> list[str] | None:
     return [f"clicked '{best['label'][:50]}'" + ("" if changed else " (but no change on screen)")]
 
 
+def start_markers(test: dict) -> list[str]:
+    """What must be on screen for the test to start: its first fields and the labels its steps use."""
+    marks = [f["field"] for f in (test.get("fill") or [])[:2] if f.get("field")]
+    for step in test.get("steps", [])[:1]:
+        m = STEP_CLICK.match(step)
+        if m:
+            marks.append(label_candidates(m.group("label"))[-1])
+    return marks
+
+
+def state_ready(test: dict, app: str) -> bool:
+    """Look instead of assume: are the test's starting elements on screen?"""
+    marks = start_markers(test)
+    if not marks:
+        return True
+    items = [i for i in agent.read_screen(app) if i.get("page")]
+    fields = [i for i in items if i["role"] in FIELD_ROLES]
+    for mark in marks:
+        if best_field(mark, fields) is None and not any(
+                " ".join(fold(mark)) and " ".join(fold(mark)) in " ".join(fold(i["label"])) for i in items):
+            return False
+    return True
+
+
+def prepare(test: dict, prefix: list[dict], page_url: str, client, ctx, app: str, account) -> str | None:
+    """Bring the page to the state the test starts from. Returns None when ready, else why not.
+    1) maybe it already is (sites remember form progress across reloads);
+    2) else redo the tests that lead there; 3) else start over in a fresh private window and redo them."""
+    if state_ready(test, app):
+        return None
+    for fresh in (False, True):
+        if fresh:
+            if WINDOW is None:
+                break
+            WINDOW.reset(page_url)
+            goto(app, page_url)
+        if prefix and not replay(prefix, client, ctx, app, account):
+            continue
+        if state_ready(test, app):
+            return None
+    return ("the page is not in the state this test starts from (looked for: "
+            + ", ".join(start_markers(test)) + "). " + screen_note(app, []))
+
+
 def replay(prefix: list[dict], client, ctx, app: str, account: dict | None) -> bool:
     """Bring the page back to the state a follow-up test starts from: redo the tests that led there."""
     for t in prefix:
@@ -880,10 +944,15 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
     io.progress(f"    ▸ {test['title']}")
     if prefix:
         rec["after"] = " → ".join(t["title"] for t in prefix)
-        if not replay(prefix, client, ctx, app, account):
-            rec["status"], rec["note"] = "error", f"Could not reach the starting state: {rec['after']}"
+    why = prepare(test, prefix or [], page_url, client, ctx, app, account)
+    if why:
+        rec["status"], rec["note"] = "error", f"Could not start: {why}"
     rec["fill"] = [{"field": f.get("field"), "value": masked(secret(str(f.get("value", "")), account), account)}
                    for f in test.get("fill") or []]
+    before = None
+    if not rec["status"]:
+        b = screen_for_check(app)
+        before = {k: b[k] for k in ("url", "title", "headings")} | {"text_on_page": b["text_on_page"][:40]}
     if test.get("fill") and not rec["status"]:
         if WINDOW is not None:
             WINDOW.ensure_front()
@@ -916,7 +985,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
     if not rec["status"]:
         if WINDOW is not None:
             WINDOW.ensure_front()
-        rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, test["expect"])
+        rec["status"], rec["confidence"], rec["note"] = check(client, gem, app, test["expect"], before)
     if rec["status"] != "passed":
         rec["screenshot"] = screenshot(app, out_dir / f"test{number}.png")
     rec["duration_s"] = round(time.time() - t0, 1)

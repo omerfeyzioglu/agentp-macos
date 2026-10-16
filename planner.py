@@ -285,6 +285,9 @@ Test a form like a careful QA engineer, one rule per test:
     ID patterns, out-of-range numbers or dates, too short password;
   - a required checkbox (consent, terms) left unchecked;
   - boundaries: very long input (100+ characters), leading/trailing spaces, Turkish characters (ğüşıöç).
+For invalid input, write "expect" as what any correct site does: "the form does not move on to the next
+step" — and, if the field has a visible rule, "and a message about <field> is shown or the field is
+marked". Sites differ: some show messages, some only keep the button from advancing.
 {"A test account exists: for login forms use the values {{username}} and {{password}} exactly as written."
  if has_account else "No test account is available: test login forms only with wrong credentials."}
 
