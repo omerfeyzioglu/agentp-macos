@@ -701,18 +701,45 @@ def best_field(name: str, fields: list[dict]) -> dict | None:
     return best if score(best) > 0 else None
 
 
-def set_value(it: dict, value: str, ctx) -> bool:
-    """Put text into a field through the accessibility API (no keyboard focus needed: a screen-sharing
-    bar or another window may hold it). True if the field now holds the value."""
+def same_text(got, want: str) -> bool:
+    """Does the field hold what was typed? Sites reformat input ('34ABC123' → '34 ABC 123',
+    '5321234567' → '(532) 123 45 67'), so spaces, punctuation and case are ignored."""
+    if not isinstance(got, str):
+        return False
+    norm_ = lambda t: re.sub(r"[\s\-().+_/]", "", t).casefold()  # noqa: E731
+    return norm_(got) == norm_(want) or (norm_(want) != "" and norm_(want) in norm_(got))
+
+
+def type_into(it: dict, value: str, ctx) -> str | None:
+    """Type into a field the way a person does: click it (a real click: focuses the test window and the
+    field whatever else holds the keyboard, e.g. a screen-sharing bar), select all, paste. Falls back to
+    setting the value through the accessibility API. Returns None when the field holds the value,
+    otherwise what the field shows."""
     el = it.get("el")
     if el is None or ctx is None or ctx.dry_run:
-        return False
+        return None
     agent.reveal(it)
-    agent.AXUIElementSetAttributeValue(el, "AXFocused", True)
-    if agent.AXUIElementSetAttributeValue(el, "AXValue", value) != 0:
-        return False
+    if not agent.mouse_click(it):
+        agent.AXUIElementSetAttributeValue(el, "AXFocused", True)
+    time.sleep(0.15)
+    # keys go straight to the browser (not to whatever app is in front)
+    if not agent.press_keys(ctx, agent.KEYCODES["a"], ["command"]):
+        agent.keystroke(ctx, "a", ["command"])
+    if value:
+        agent.paste_text(value, ctx)
+    elif not agent.press_keys(ctx, 51):
+        agent.key(51, ctx)   # delete: leave it empty on purpose
+    time.sleep(0.25)
     got = agent.ax(el, "AXValue")
-    return isinstance(got, str) and got.strip() == value.strip()
+    secure = "secure" in str(agent.ax(el, "AXSubrole") or "").casefold()
+    if (secure and got is None) or same_text(got, value) or (value == "" and not (got or "").strip()):
+        return None
+    if agent.AXUIElementSetAttributeValue(el, "AXValue", value) == 0:   # no keyboard: set it directly
+        time.sleep(0.15)
+        got = agent.ax(el, "AXValue")
+        if same_text(got, value) or (value == "" and not (got or "").strip()):
+            return None
+    return str(got)[:60] if got is not None else "(unreadable)"
 
 
 def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[str]:
@@ -752,14 +779,14 @@ def fill_form(fills: list[dict], ctx, app: str, account: dict | None) -> list[st
                 agent.paste_text(value, ctx)
                 agent.key(36, ctx)
             done.append(f"selected '{value[:40]}' in '{it['label'][:40]}'")
-        elif value == "":
-            agent.execute({"action": "type", "element": it, "text": " "}, name, ctx)
-            agent.keystroke(ctx, "a", ["command"])
-            agent.key(51, ctx)   # leave it empty on purpose (validation tests)
-            done.append(f"cleared '{it['label'][:40]}'")
         else:
-            if not set_value(it, value, ctx):   # focus-independent first; typing as a fallback
-                agent.execute({"action": "type", "element": it, "text": value}, f"type {name}", ctx)
+            shows = type_into(it, value, ctx)
+            if shows is not None:
+                raise RuntimeError(f"could not type into '{it['label'][:40]}': it shows {shows!r}")
+            if value == "":
+                done.append(f"cleared '{it['label'][:40]}'")
+                time.sleep(0.2)
+                continue
             shown = "••••••" if kind == "password" or (account and value == account.get("password")) else value[:40]
             done.append(f"filled '{it['label'][:40]}' = {shown}")
         time.sleep(0.2)
@@ -1125,7 +1152,7 @@ def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None, stop=No
     if req.get("error"):
         base_io.say(f"✗ {req['error']}")
         return {}
-    focused = bool(req.get("this_page") or req.get("page_hint") or req.get("focus"))
+    focused = bool(req.get("this_page") or req.get("page_hint") or req.get("focus") or req.get("single_page"))
     if req.get("hops") and not req.get("focus"):
         req["focus"] = req["hops"][-1]   # "kayıt formu" is also what to focus the tests on
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
