@@ -41,6 +41,7 @@ if [ ! -x .venv/bin/python ] || ! cmp -s requirements.txt "$stamp"; then
   "$PY" -m venv .venv
   .venv/bin/python -m pip install --quiet --upgrade pip
   .venv/bin/python -m pip install --quiet -r requirements.txt
+  .venv/bin/python -m playwright install chromium   # the browser web tests run in (~100 MB, once)
   cp requirements.txt "$stamp"
   echo "Done."
 fi

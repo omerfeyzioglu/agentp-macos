@@ -318,10 +318,10 @@ def form_fields(items: list[dict]) -> list[dict]:
 
 CONSENT_TEXT = re.compile(r"cookie|çerez", re.I)   # only an actual cookie notice, not a footer "Privacy" link
 CONSENT_PREFER = [   # the most privacy-preserving choice first
-    re.compile(r"^(reject|decline|deny)( all)?$|^tümünü reddet$|^reddet$|only (necessary|essential)|sadece (gerekli|zorunlu)|"
-               r"necessary only|yalnızca zorunlu|zorunlu (çerezler|olanlar)", re.I),
-    re.compile(r"^(accept|agree|allow|ok|okay|got it|i agree|kabul( et)?|tümünü kabul et|tamam|anladım|onayla|"
-               r"accept all|allow all|accept cookies|çerezleri kabul et)( all)?[.!]?$", re.I),
+    re.compile(r"^(reject|decline|deny)( all)?( cookies)?$|^(tüm(ünü)? )?(çerezleri )?reddet$|only (necessary|essential)|"
+               r"sadece (gerekli|zorunlu)|necessary only|yalnızca zorunlu|zorunlu (çerezler|olanlar)", re.I),
+    re.compile(r"^(accept|agree|allow|ok|okay|got it|i agree|kabul( et)?|tamam|anladım|onayla|"
+               r"accept all|allow all|accept cookies|(tüm(ünü)? )?(çerezleri )?kabul et)( all)?[.!]?$", re.I),
     # no "X" / "Close": too easily a social link (X/Twitter) or something unrelated
 ]
 
@@ -1362,9 +1362,22 @@ def run_request(cmd: str, client, base_io, allow_submit: bool, gem=None, stop=No
     if req.get("hops") and not req.get("focus"):
         req["focus"] = req["hops"][-1]   # "kayıt formu" is also what to focus the tests on
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
-    return run_session(req["site"], client, base_io, pages=1 if single else 6,
-                       tests_per_page=8 if focused else 3, allow_submit=allow_submit,
-                       focus=req.get("focus", ""), page_hint=req.get("page_hint", ""), stop=stop)
+    kw = dict(pages=1 if single else 6, tests_per_page=8 if focused else 3, allow_submit=allow_submit,
+              focus=req.get("focus", ""), page_hint=req.get("page_hint", ""), stop=stop)
+    if web_engine():
+        import webqa
+        return webqa.run_session(req["site"], client, base_io, gem=gem, **kw)
+    return run_session(req["site"], client, base_io, **kw)
+
+
+def web_engine() -> bool:
+    """Tests run inside the browser (Playwright) when it is installed; AGENTP_QA_ENGINE=screen keeps the
+    accessibility-based engine."""
+    import os
+    if os.environ.get("AGENTP_QA_ENGINE", "").casefold() == "screen":
+        return False
+    import webqa
+    return webqa.available()
 
 
 def test_target(cmd: str) -> str | None:
@@ -1392,7 +1405,7 @@ def main():
     ap.add_argument("--password", help="its password (asked hidden if --user is given without it)")
     args = ap.parse_args()
     agent.check_env()
-    if not agent.AXIsProcessTrusted():
+    if not web_engine() and not agent.AXIsProcessTrusted():
         sys.exit(agent.PERM_MSG)
     request = " ".join(args.site)
     allow = not args.no_submit
@@ -1410,10 +1423,15 @@ def main():
         sys.exit(req.get("error") or f"Could not tell which site to test from '{request}'.")
     single = req.get("this_page") or req.get("page_hint") or req.get("single_page")
     focus = req.get("focus") or (req["hops"][-1] if req.get("hops") else "")
-    r = run_session(req["site"], TypeSafeClient(), agent.CliIO(), 1 if single and args.pages == 6 else args.pages,
-                    args.minutes, 8 if single and args.tests == 3 else args.tests, allow,
-                    Path(args.out) if args.out else None, account,
-                    focus=focus, page_hint=req.get("page_hint", ""))
+    if web_engine():
+        import webqa
+        session = webqa.run_session
+    else:
+        session = run_session
+    r = session(req["site"], TypeSafeClient(), agent.CliIO(), 1 if single and args.pages == 6 else args.pages,
+                args.minutes, 8 if single and args.tests == 3 else args.tests, allow,
+                Path(args.out) if args.out else None, account,
+                focus=focus, page_hint=req.get("page_hint", ""))
     if r.get("report"):
         subprocess.run(["open", r["report"]["html"]], check=False)
     bad = [t for t in r.get("tests", []) if t["status"] in ("failed", "error")]
