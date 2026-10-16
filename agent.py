@@ -1071,6 +1071,24 @@ def pick_action(a, apps: list, text_opts: dict, items: list, ctx: Ctx, cmd: str,
     return a["action"].choice
 
 # ---------------------------------------------------------------- actions
+def hits_own_app(el, x: float, y: float) -> bool:
+    """Is the element's own app what is actually on screen at (x, y)? A real click goes to whatever is on
+    top there; this keeps it from landing on the desktop, a terminal or a floating panel."""
+    try:
+        from ApplicationServices import AXUIElementCopyElementAtPosition, AXUIElementCreateSystemWide, AXUIElementGetPid
+        err, want = AXUIElementGetPid(el, None)
+        if err != 0:
+            return False
+        err2, top = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), x, y, None)
+        if err2 != 0 or top is None:   # cannot tell what is at that point: at least the app must be in front
+            front = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return front is not None and front.processIdentifier() == want
+        err3, got = AXUIElementGetPid(top, None)
+        return err3 == 0 and got == want
+    except Exception:
+        return False
+
+
 def mouse_click(it: dict) -> bool:
     """A real click at the element's centre, for web/Electron elements that ignore AXPress.
     The pointer is put back where it was."""
@@ -1079,6 +1097,8 @@ def mouse_click(it: dict) -> bool:
     if not rect or rect[2] <= 0 or rect[3] <= 0:
         return False
     x, y = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2   # AX and CG share top-left screen coordinates
+    if not hits_own_app(it["el"], x, y):
+        return False   # something else is on top there (desktop, a terminal, a panel): never click it
     old = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
     for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
         ev = Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)

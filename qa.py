@@ -571,6 +571,10 @@ def run_session(target: str, client, base_io, pages: int = 6, minutes: float = 1
     in_scope = lambda: domain(current_url(app) or url).endswith(scope)  # noqa: E731
     io = QAIO(base_io, allow_submit, in_scope)
     ctx.io, ctx.record, ctx.active_app = io, False, app
+    # AgentP's own process, never the browser (it was taken from whatever app was in front at start:
+    # when that was the browser, the agent dropped it and went back to the desktop / terminal)
+    from AppKit import NSRunningApplication
+    ctx.own_app = str(NSRunningApplication.currentApplication().localizedName() or "Python")
     stopped = stop or (lambda: False)
     ctx.stop = stopped
     ctx.url_opener = lambda u: WINDOW.goto(u)
@@ -1043,6 +1047,7 @@ def run_test(client, gem, ctx, io, app: str, page_url: str, test: dict, out_dir:
             rec["status"], rec["note"] = "error", f"Could not fill the form: {e}"
     for step in ([] if rec["status"] else test["steps"]):
         step = secret(step, account)
+        ctx.active_app = app        # every step acts in the browser, whatever happened before
         if WINDOW is not None:
             WINDOW.ensure_front()   # the user may have switched windows: act only in the test window
         blocked_before = len(io.blocked)
